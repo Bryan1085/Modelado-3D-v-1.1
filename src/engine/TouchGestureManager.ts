@@ -41,7 +41,7 @@ export const TOUCH_MODIFIER_REGISTRY: TouchModifierDescriptor[] = [
     badgeText: 'SHIFT',
     implemented: true,
     description:
-      'Mantén un dedo apoyado en el visor (Modo Edición) y toca elementos con otro dedo para sumarlos a la selección.',
+      'Mantén un dedo apoyado en el visor (Modo Objeto o Edición) y toca elementos con otro dedo para agregarlos o quitarlos de la selección.',
   },
   {
     key: 'ctrl',
@@ -80,13 +80,26 @@ export interface TouchGestureCallbacks {
     clientY: number,
     pointerType: string,
     modifiers: TouchModifierState,
+    shiftKey: boolean,
   ) => void;
   onTwoFingerTap: () => void;
   onThreeFingerTap: () => void;
   onLongPress: (clientX: number, clientY: number, pointerType: string) => void;
-  onBoxSelectStart?: (rect: BoxSelectRect, modifiers: TouchModifierState) => void;
-  onBoxSelectMove?: (rect: BoxSelectRect, modifiers: TouchModifierState) => void;
-  onBoxSelectEnd?: (rect: BoxSelectRect, modifiers: TouchModifierState) => void;
+  onBoxSelectStart?: (
+    rect: BoxSelectRect,
+    modifiers: TouchModifierState,
+    shiftKey: boolean,
+  ) => void;
+  onBoxSelectMove?: (
+    rect: BoxSelectRect,
+    modifiers: TouchModifierState,
+    shiftKey: boolean,
+  ) => void;
+  onBoxSelectEnd?: (
+    rect: BoxSelectRect,
+    modifiers: TouchModifierState,
+    shiftKey: boolean,
+  ) => void;
   onBoxSelectCancel?: () => void;
   onModifierStateChange?: (modifiers: TouchModifierState) => void;
   onTouchNavigationChange: (
@@ -199,10 +212,8 @@ export class TouchGestureManager {
     }
   }
 
-  public syncWorkMode(workMode: WorkMode): void {
-    if (workMode !== 'edit' && (this.shiftHoldActive || this.shiftHoldTimer !== null)) {
-      this.deactivateShiftHold(true);
-    }
+  public syncWorkMode(_workMode: WorkMode): void {
+    // Touch SHIFT hold is supported in both Object Mode and Edit Mode.
   }
 
   public invalidateCurrentGesture(): void {
@@ -256,10 +267,7 @@ export class TouchGestureManager {
 
   private isShiftHoldEnabled(): boolean {
     const shiftCfg = this.config.modifiers?.shift;
-    return (
-      this.callbacks.getWorkMode() === 'edit' &&
-      Boolean(shiftCfg?.enabled && shiftCfg?.twoFingerHold)
-    );
+    return Boolean(shiftCfg?.enabled && shiftCfg?.twoFingerHold);
   }
 
   private clearLongPressTimer(): void {
@@ -564,13 +572,14 @@ export class TouchGestureManager {
           this.boxSelectArmed.activeDrag = true;
           const rect = this.buildBoxRect(this.boxSelectArmed);
           const modifiers = this.getModifierState();
-          this.callbacks.onBoxSelectStart?.(rect, modifiers);
-          this.callbacks.onBoxSelectMove?.(rect, modifiers);
+          this.callbacks.onBoxSelectStart?.(rect, modifiers, e.shiftKey);
+          this.callbacks.onBoxSelectMove?.(rect, modifiers, e.shiftKey);
         }
       } else {
         this.callbacks.onBoxSelectMove?.(
           this.buildBoxRect(this.boxSelectArmed),
           this.getModifierState(),
+          e.shiftKey,
         );
       }
       return;
@@ -645,7 +654,11 @@ export class TouchGestureManager {
       );
 
       if (state.activeDrag) {
-        this.callbacks.onBoxSelectEnd?.(this.buildBoxRect(state), modifiers);
+        this.callbacks.onBoxSelectEnd?.(
+          this.buildBoxRect(state),
+          modifiers,
+          e.shiftKey,
+        );
       } else {
         // Quick second tap without dragging -> perform normal tap selection (do NOT chain into 3rd tap)
         const moveLimit =
@@ -665,6 +678,7 @@ export class TouchGestureManager {
             e.clientY,
             state.pointerType,
             modifiers,
+            e.shiftKey,
           );
         }
       }
@@ -720,6 +734,7 @@ export class TouchGestureManager {
           e.clientY,
           e.pointerType,
           this.getModifierState(),
+          e.shiftKey,
         );
       }
 
@@ -795,6 +810,7 @@ export class TouchGestureManager {
               e.clientY,
               e.pointerType,
               this.getModifierState(),
+              e.shiftKey,
             );
           } else {
             this.lastTap = null;

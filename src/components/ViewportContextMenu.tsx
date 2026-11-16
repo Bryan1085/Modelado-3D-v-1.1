@@ -360,7 +360,9 @@ export const ViewportContextMenu: React.FC<ViewportContextMenuProps> = ({
         actions.push({
           id: 'fill',
           label:
-            selectedVertexCount === 2 ? 'Conectar arista' : 'Rellenar cara',
+            selectedVertexCount === 2
+              ? 'Conectar arista (F)'
+              : 'Crear cara (Make Face)',
           icon: <PaintBucket className="w-4 h-4" />,
           disabled: selectedVertexCount < 2,
           onSelect: () => {

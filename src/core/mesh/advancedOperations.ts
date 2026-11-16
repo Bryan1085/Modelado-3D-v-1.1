@@ -2646,20 +2646,183 @@ export function applyDeleteAction(
 }
 
 /* ============================================================================
- * H. FILL — RELLENAR (Crear Arista o Cara a partir de selección)
+ * H. FILL — CREAR CARA / CONECTAR ARISTA (Make Face, tecla F)
  * ========================================================================== */
+export interface FillMeshResponse {
+  result: MeshOperatorResult;
+  nextMode?: EditSelectionMode;
+  selectExisting?: boolean;
+  createdType?: 'edge' | 'face';
+  message?: string;
+  error?: string;
+}
+
+function signedArea2D(pts: [number, number][]): number {
+  let area = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    area += a[0] * b[1] - b[0] * a[1];
+  }
+  return area * 0.5;
+}
+
+function orient2D(
+  a: [number, number],
+  b: [number, number],
+  c: [number, number],
+): number {
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+function onSegment2D(
+  p: [number, number],
+  a: [number, number],
+  b: [number, number],
+  eps = 1e-7,
+): boolean {
+  return (
+    p[0] >= Math.min(a[0], b[0]) - eps &&
+    p[0] <= Math.max(a[0], b[0]) + eps &&
+    p[1] >= Math.min(a[1], b[1]) - eps &&
+    p[1] <= Math.max(a[1], b[1]) + eps
+  );
+}
+
+function segmentsIntersect2D(
+  a1: [number, number],
+  a2: [number, number],
+  b1: [number, number],
+  b2: [number, number],
+): boolean {
+  const eps = 1e-7;
+  const o1 = orient2D(a1, a2, b1);
+  const o2 = orient2D(a1, a2, b2);
+  const o3 = orient2D(b1, b2, a1);
+  const o4 = orient2D(b1, b2, a2);
+
+  if (
+    ((o1 > eps && o2 < -eps) || (o1 < -eps && o2 > eps)) &&
+    ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps))
+  ) {
+    return true;
+  }
+
+  if (Math.abs(o1) <= eps && onSegment2D(b1, a1, a2, eps)) return true;
+  if (Math.abs(o2) <= eps && onSegment2D(b2, a1, a2, eps)) return true;
+  if (Math.abs(o3) <= eps && onSegment2D(a1, b1, b2, eps)) return true;
+  if (Math.abs(o4) <= eps && onSegment2D(a2, b1, b2, eps)) return true;
+  return false;
+}
+
+function has2DSelfIntersection(pts: [number, number][]): boolean {
+  const n = pts.length;
+  if (n < 4) return false;
+  for (let i = 0; i < n; i++) {
+    const a1 = pts[i];
+    const a2 = pts[(i + 1) % n];
+    for (let j = i + 2; j < n; j++) {
+      // Skip adjacent edges sharing a vertex
+      if (i === 0 && j === n - 1) continue;
+      const b1 = pts[j];
+      const b2 = pts[(j + 1) % n];
+      if (segmentsIntersect2D(a1, a2, b1, b2)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function buildTopoContourLoop(
+  vertIds: string[],
+  edgeList: { v0: string; v1: string }[],
+): string[] | null {
+  if (vertIds.length < 3 || edgeList.length < vertIds.length - 1) {
+    return null;
+  }
+  const vertSet = new Set(vertIds);
+  const adj = new Map<string, Set<string>>();
+  for (const vid of vertIds) adj.set(vid, new Set());
+  for (const e of edgeList) {
+    if (vertSet.has(e.v0) && vertSet.has(e.v1) && e.v0 !== e.v1) {
+      adj.get(e.v0)!.add(e.v1);
+      adj.get(e.v1)!.add(e.v0);
+    }
+  }
+
+  // Check single connected component
+  const visited = new Set<string>();
+  const queue = [vertIds[0]];
+  visited.add(vertIds[0]);
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    for (const nxt of adj.get(curr) ?? []) {
+      if (!visited.has(nxt)) {
+        visited.add(nxt);
+        queue.push(nxt);
+      }
+    }
+  }
+  if (visited.size !== vertIds.length) return null;
+
+  const degreeOne: string[] = [];
+  for (const vid of vertIds) {
+    const deg = adj.get(vid)!.size;
+    if (deg < 1 || deg > 2) return null;
+    if (deg === 1) degreeOne.push(vid);
+  }
+
+  // Closed cycle (all degree 2) or single open chain (two degree-1 endpoints)
+  if (degreeOne.length !== 0 && degreeOne.length !== 2) {
+    return null;
+  }
+
+  const start = degreeOne.length === 2 ? degreeOne[0] : vertIds[0];
+  const walked: string[] = [];
+  const walkSeen = new Set<string>();
+  let curr: string | undefined = start;
+  let prev: string | null = null;
+  while (curr && !walkSeen.has(curr)) {
+    walkSeen.add(curr);
+    walked.push(curr);
+    const neighbors: string[] = Array.from(adj.get(curr) ?? []);
+    const next: string | undefined = neighbors.find((n: string) => n !== prev);
+    prev = curr;
+    curr = next;
+  }
+
+  return walked.length === vertIds.length ? walked : null;
+}
+
+function computeLoopNewellNormal(mesh: EditableMesh, loop: string[]): Vec3 {
+  let nx = 0;
+  let ny = 0;
+  let nz = 0;
+  const n = loop.length;
+  for (let i = 0; i < n; i++) {
+    const curr = mesh.getVertex(loop[i])?.position;
+    const next = mesh.getVertex(loop[(i + 1) % n])?.position;
+    if (!curr || !next) continue;
+    nx += (curr[1] - next[1]) * (curr[2] + next[2]);
+    ny += (curr[2] - next[2]) * (curr[0] + next[0]);
+    nz += (curr[0] - next[0]) * (curr[1] + next[1]);
+  }
+  return normVec([nx, ny, nz], [0, 0, 1]);
+}
+
 export function fillMesh(
   sourceMesh: EditableMesh,
   mode: EditSelectionMode,
   selectedIds: Set<string>,
-): { result: MeshOperatorResult; message?: string } {
+): FillMeshResponse {
   const mesh = sourceMesh.clone();
   const nextSelected = new Set<string>();
 
   if (selectedIds.size === 0) {
     return {
       result: { mesh, nextSelectedIds: nextSelected },
-      message: 'Selecciona al menos 2 vértices o aristas para rellenar',
+      error: 'Selecciona al menos 2 vértices o aristas para crear geometría',
     };
   }
 
@@ -2669,126 +2832,326 @@ export function fillMesh(
   if (vertIds.length < 2) {
     return {
       result: { mesh, nextSelectedIds: nextSelected },
-      message: 'Selecciona al menos 2 vértices para crear una arista o cara',
+      error: 'Selecciona al menos 2 vértices para crear una arista o cara',
     };
   }
 
   // Case 1: Exactly 2 vertices -> connect with an edge
   if (vertIds.length === 2) {
-    const existing = mesh.findEdgeId(vertIds[0], vertIds[1]);
-    if (existing) {
+    const v0 = mesh.getVertex(vertIds[0]);
+    const v1 = mesh.getVertex(vertIds[1]);
+    if (!v0 || !v1 || lenVec(subVec(v1.position, v0.position)) < 1e-7) {
       return {
         result: { mesh, nextSelectedIds: new Set(selectedIds) },
+        error: 'Los vértices seleccionados están superpuestos',
+      };
+    }
+    const existing = mesh.findEdgeId(vertIds[0], vertIds[1]);
+    if (existing) {
+      const sel =
+        mode === 'edge' ? new Set<string>([existing]) : new Set<string>(vertIds);
+      return {
+        result: { mesh, nextSelectedIds: sel },
+        nextMode: mode === 'edge' ? 'edge' : undefined,
+        selectExisting: true,
         message: 'Ya existe una arista entre los dos vértices',
       };
     }
     const edge = mesh.addEdge(vertIds[0], vertIds[1]);
-    if (edge && mode === 'edge') nextSelected.add(edge.id);
-    else if (mode === 'vertex') {
+    if (edge && mode === 'edge') {
+      nextSelected.add(edge.id);
+    } else {
       nextSelected.add(vertIds[0]);
       nextSelected.add(vertIds[1]);
     }
-    return { result: { mesh, nextSelectedIds: nextSelected } };
+    return {
+      result: { mesh, nextSelectedIds: nextSelected },
+      nextMode: mode === 'edge' ? 'edge' : undefined,
+      createdType: 'edge',
+      message: 'Arista creada',
+    };
   }
 
-  // Case 2: 3+ vertices -> build a cyclic loop and fill with a face
-  // First try walking a single closed cycle along edges connecting vertIdsSet
-  const adj = new Map<string, string[]>();
-  for (const vid of vertIds) adj.set(vid, []);
-  for (const edge of mesh.edges) {
-    if (vertIdsSet.has(edge.v0) && vertIdsSet.has(edge.v1)) {
-      adj.get(edge.v0)!.push(edge.v1);
-      adj.get(edge.v1)!.push(edge.v0);
-    }
+  // Case 2: 3+ vertices -> prevent exact duplicate face first (select existing face cleanly)
+  const existingFace = mesh.faces.find((f) => {
+    const uniqueVerts = new Set(f.vertexIds);
+    return (
+      uniqueVerts.size === vertIds.length &&
+      f.vertexIds.every((vid) => vertIdsSet.has(vid))
+    );
+  });
+  if (existingFace) {
+    return {
+      result: { mesh, nextSelectedIds: new Set([existingFace.id]) },
+      nextMode: 'face',
+      selectExisting: true,
+      message: 'Cara existente seleccionada',
+    };
   }
 
-  let orderedLoop: string[] | null = null;
-  const allDegreeTwo = vertIds.every((vid) => (adj.get(vid)?.length ?? 0) === 2);
-  if (allDegreeTwo) {
-    const walked: string[] = [];
-    const visited = new Set<string>();
-    let curr: string | undefined = vertIds[0];
-    let prev: string | null = null;
-    while (curr && !visited.has(curr)) {
-      visited.add(curr);
-      walked.push(curr);
-      const neighbors: string[] = adj.get(curr) ?? [];
-      const next: string | undefined = neighbors.find((n: string) => n !== prev);
-      prev = curr;
-      curr = next;
-    }
-    if (walked.length === vertIds.length) {
-      orderedLoop = walked;
-    }
-  }
-
-  // Fallback: project onto best-fit plane around centroid and sort angularly
-  if (!orderedLoop) {
-    const centroid = mesh.computeCentroid(vertIds) ?? [0, 0, 0];
-    const pts = vertIds.map((vid) => mesh.getVertex(vid)!.position);
-    // Estimate plane normal via average cross products around centroid
-    let nx = 0;
-    let ny = 0;
-    let nz = 0;
-    for (let i = 0; i < pts.length; i++) {
-      for (let j = i + 1; j < pts.length; j++) {
-        const a = subVec(pts[i], centroid);
-        const b = subVec(pts[j], centroid);
-        const c = crossVec(a, b);
-        if (dotVec(c, [nx, ny, nz]) < 0) {
-          nx -= c[0];
-          ny -= c[1];
-          nz -= c[2];
-        } else {
-          nx += c[0];
-          ny += c[1];
-          nz += c[2];
-        }
-      }
-    }
-    const normal = normVec([nx, ny, nz], [0, 0, 1]);
-    const ref: Vec3 = Math.abs(normal[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-    const u = normVec(crossVec(ref, normal), [1, 0, 0]);
-    const v = normVec(crossVec(normal, u), [0, 0, 1]);
-
-    orderedLoop = [...vertIds].sort((idA, idB) => {
-      const dA = subVec(mesh.getVertex(idA)!.position, centroid);
-      const dB = subVec(mesh.getVertex(idB)!.position, centroid);
-      const angA = Math.atan2(dotVec(dA, v), dotVec(dA, u));
-      const angB = Math.atan2(dotVec(dB, v), dotVec(dB, u));
-      return angA - angB;
-    });
-  }
-
-  // Prevent exact duplicate face
-  const sortedTarget = [...orderedLoop].sort().join('|');
-  const duplicateFace = mesh.faces.find(
-    (f) =>
-      f.vertexIds.length === orderedLoop!.length &&
-      [...f.vertexIds].sort().join('|') === sortedTarget,
-  );
-  if (duplicateFace) {
+  if (mode === 'face') {
     return {
       result: { mesh, nextSelectedIds: new Set(selectedIds) },
-      message: 'Ya existe una cara con esos vértices',
+      error: 'Selecciona vértices o aristas para crear una cara nueva',
     };
+  }
+
+  // Validate non-coincident vertices and non-collinear 3D span
+  const pts = vertIds.map((vid) => mesh.getVertex(vid)!.position);
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) {
+      if (lenVec(subVec(pts[j], pts[i])) < 1e-7) {
+        return {
+          result: { mesh, nextSelectedIds: new Set(selectedIds) },
+          error: 'Existen vértices superpuestos en la selección',
+        };
+      }
+    }
+  }
+
+  const pA = pts[0];
+  let pB = pts[1];
+  let maxDist = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = lenVec(subVec(pts[i], pA));
+    if (d > maxDist) {
+      maxDist = d;
+      pB = pts[i];
+    }
+  }
+  const abVec = subVec(pB, pA);
+  const abLen = lenVec(abVec);
+  if (abLen < 1e-7) {
+    return {
+      result: { mesh, nextSelectedIds: new Set(selectedIds) },
+      error: 'Los vértices seleccionados son colineales o están superpuestos',
+    };
+  }
+
+  let pC = pts[1];
+  let maxCrossLen = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const cLen = lenVec(crossVec(abVec, subVec(pts[i], pA)));
+    if (cLen > maxCrossLen) {
+      maxCrossLen = cLen;
+      pC = pts[i];
+    }
+  }
+  if (maxCrossLen / abLen < 1e-6) {
+    return {
+      result: { mesh, nextSelectedIds: new Set(selectedIds) },
+      error: 'Los vértices están alineados y no forman una cara válida',
+    };
+  }
+
+  // Compute robust best-fit plane around centroid
+  const centroid = mesh.computeCentroid(vertIds) ?? [0, 0, 0];
+  const seedNormal = normVec(
+    crossVec(abVec, subVec(pC, pA)),
+    [0, 0, 1],
+  );
+  let nx = 0;
+  let ny = 0;
+  let nz = 0;
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) {
+      const a = subVec(pts[i], centroid);
+      const b = subVec(pts[j], centroid);
+      const c = crossVec(a, b);
+      if (dotVec(c, seedNormal) < 0) {
+        nx -= c[0];
+        ny -= c[1];
+        nz -= c[2];
+      } else {
+        nx += c[0];
+        ny += c[1];
+        nz += c[2];
+      }
+    }
+  }
+  const bestNormal = normVec([nx, ny, nz], seedNormal);
+  const ref: Vec3 = Math.abs(bestNormal[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  const uAxis = normVec(crossVec(ref, bestNormal), [1, 0, 0]);
+  const vAxis = normVec(crossVec(bestNormal, uAxis), [0, 0, 1]);
+
+  const projectById = new Map<string, [number, number]>();
+  for (const vid of vertIds) {
+    const d = subVec(mesh.getVertex(vid)!.position, centroid);
+    projectById.set(vid, [dotVec(d, uAxis), dotVec(d, vAxis)]);
+  }
+  const toPoly2D = (loop: string[]): [number, number][] =>
+    loop.map((id) => projectById.get(id)!);
+
+  // Step 1: Try topological edge loop / open chain first
+  let orderedLoop: string[] | null = null;
+  if (mode === 'edge') {
+    const selEdges: { v0: string; v1: string }[] = [];
+    for (const eid of selectedIds) {
+      const e = mesh.getEdge(eid);
+      if (e) selEdges.push(e);
+    }
+    orderedLoop = buildTopoContourLoop(vertIds, selEdges);
+  } else {
+    const subEdges = mesh.edges.filter(
+      (e) => vertIdsSet.has(e.v0) && vertIdsSet.has(e.v1),
+    );
+    orderedLoop = buildTopoContourLoop(vertIds, subEdges);
+  }
+
+  if (orderedLoop) {
+    const poly2D = toPoly2D(orderedLoop);
+    if (
+      Math.abs(signedArea2D(poly2D)) <= 1e-7 ||
+      has2DSelfIntersection(poly2D)
+    ) {
+      orderedLoop = null;
+    }
+  }
+
+  // Step 2: Geometric contour sorting for disconnected or partial vertices
+  if (!orderedLoop) {
+    const sorted = [...vertIds].sort((idA, idB) => {
+      const p2A = projectById.get(idA)!;
+      const p2B = projectById.get(idB)!;
+      return Math.atan2(p2A[1], p2A[0]) - Math.atan2(p2B[1], p2B[0]);
+    });
+
+    const sorted2D = toPoly2D(sorted);
+    if (
+      Math.abs(signedArea2D(sorted2D)) > 1e-7 &&
+      !has2DSelfIntersection(sorted2D)
+    ) {
+      orderedLoop = sorted;
+    } else if (vertIds.length === 4) {
+      // Evaluate the 3 cyclic quad permutations to avoid bowtie crossings
+      const candidates: string[][] = [
+        [sorted[0], sorted[1], sorted[2], sorted[3]],
+        [sorted[0], sorted[1], sorted[3], sorted[2]],
+        [sorted[0], sorted[2], sorted[1], sorted[3]],
+      ];
+      let bestCandidate: string[] | null = null;
+      let bestArea = 1e-7;
+      for (const cand of candidates) {
+        const poly = toPoly2D(cand);
+        const areaAbs = Math.abs(signedArea2D(poly));
+        if (areaAbs > bestArea && !has2DSelfIntersection(poly)) {
+          bestArea = areaAbs;
+          bestCandidate = cand;
+        }
+      }
+      orderedLoop = bestCandidate;
+    } else {
+      // 2-opt uncrossing for larger disconnected vertex sets
+      const loop = [...sorted];
+      const n = loop.length;
+      for (let pass = 0; pass < n * n; pass++) {
+        let fixedAny = false;
+        const poly = toPoly2D(loop);
+        for (let i = 0; i < n && !fixedAny; i++) {
+          const a1 = poly[i];
+          const a2 = poly[(i + 1) % n];
+          for (let j = i + 2; j < n; j++) {
+            if (i === 0 && j === n - 1) continue;
+            const b1 = poly[j];
+            const b2 = poly[(j + 1) % n];
+            if (segmentsIntersect2D(a1, a2, b1, b2)) {
+              // Reverse sub-array (i+1 .. j) to uncross
+              let l = i + 1;
+              let r = j;
+              while (l < r) {
+                const tmp = loop[l];
+                loop[l] = loop[r];
+                loop[r] = tmp;
+                l++;
+                r--;
+              }
+              fixedAny = true;
+              break;
+            }
+          }
+        }
+        if (!fixedAny) break;
+      }
+      const poly = toPoly2D(loop);
+      if (
+        Math.abs(signedArea2D(poly)) > 1e-7 &&
+        !has2DSelfIntersection(poly)
+      ) {
+        orderedLoop = loop;
+      }
+    }
+  }
+
+  if (!orderedLoop) {
+    return {
+      result: { mesh, nextSelectedIds: new Set(selectedIds) },
+      error: 'No se pudo formar una cara válida sin autointersecciones',
+    };
+  }
+
+  // Step 3: Coherent normal orientation matching adjacent faces (or outward/upward)
+  let consistentVotes = 0;
+  const loopLen = orderedLoop.length;
+  for (let i = 0; i < loopLen; i++) {
+    const a = orderedLoop[i];
+    const b = orderedLoop[(i + 1) % loopLen];
+    const eid = mesh.findEdgeId(a, b);
+    if (!eid) continue;
+    for (const fid of mesh.getFacesForEdge(eid)) {
+      const adj = mesh.getFace(fid);
+      if (!adj) continue;
+      const m = adj.vertexIds.length;
+      for (let k = 0; k < m; k++) {
+        const u = adj.vertexIds[k];
+        const v = adj.vertexIds[(k + 1) % m];
+        if (u === b && v === a) consistentVotes += 1;
+        else if (u === a && v === b) consistentVotes -= 1;
+      }
+    }
+  }
+
+  if (consistentVotes < 0) {
+    orderedLoop.reverse();
+  } else if (consistentVotes === 0) {
+    const faceNormal = computeLoopNewellNormal(mesh, orderedLoop);
+    const faceCenter = mesh.computeCentroid(orderedLoop) ?? centroid;
+    const meshCenter =
+      mesh.computeCentroid(mesh.vertices.map((v) => v.id)) ?? faceCenter;
+    const outwardVec = subVec(faceCenter, meshCenter);
+    const outwardDot = dotVec(faceNormal, outwardVec);
+    if (
+      mesh.faces.length > 0 &&
+      lenVec(outwardVec) > 1e-4 &&
+      Math.abs(outwardDot) > 1e-5
+    ) {
+      if (outwardDot < 0) {
+        orderedLoop.reverse();
+      }
+    } else if (Math.abs(faceNormal[2]) > 0.25) {
+      if (faceNormal[2] < 0) orderedLoop.reverse();
+    } else if (Math.abs(faceNormal[1]) > 0.25) {
+      if (faceNormal[1] > 0) orderedLoop.reverse();
+    } else if (faceNormal[0] < 0) {
+      orderedLoop.reverse();
+    }
   }
 
   const face = mesh.addFace(orderedLoop);
   if (!face) {
     return {
       result: { mesh, nextSelectedIds: new Set(selectedIds) },
-      message: 'No se pudo crear la cara',
+      error: 'No se pudo crear la cara',
     };
   }
 
-  if (mode === 'face') {
-    nextSelected.add(face.id);
-  } else {
-    for (const id of selectedIds) nextSelected.add(id);
-  }
+  nextSelected.add(face.id);
 
-  return { result: { mesh, nextSelectedIds: nextSelected } };
+  return {
+    result: { mesh, nextSelectedIds: nextSelected },
+    nextMode: 'face',
+    createdType: 'face',
+    message: 'Cara creada',
+  };
 }
 
 /* ============================================================================

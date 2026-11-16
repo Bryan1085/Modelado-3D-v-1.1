@@ -264,10 +264,11 @@ export const RADIAL_ACTION_LIBRARY: RadialActionDefinition[] = [
     id: 'toggle_shift_modifier',
     label: 'Alternar SHIFT en pantalla',
     shortLabel: 'SHIFT',
-    description: 'Activa o desactiva el modificador SHIFT para sumar selección',
+    description:
+      'Activa o desactiva el modificador SHIFT para agregar o quitar elementos de la selección',
     category: 'selection',
     icon: 'shift',
-    supportedModes: ['edit'],
+    supportedModes: ['object', 'edit'],
   },
 
   // 3. Transformación
@@ -419,9 +420,10 @@ export const RADIAL_ACTION_LIBRARY: RadialActionDefinition[] = [
   },
   {
     id: 'fill_mesh',
-    label: 'Rellenar / Crear cara',
-    shortLabel: 'Rellenar',
-    description: 'Crea arista o cara nueva a partir de vértices o aristas (F)',
+    label: 'Crear cara (Make Face)',
+    shortLabel: 'Crear cara',
+    description:
+      'Crea una cara nueva o arista a partir de vértices o aristas seleccionadas (F)',
     category: 'creation',
     icon: 'fill',
     supportedModes: ['edit'],

@@ -385,6 +385,8 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
       case 'op_merge':
       case 'op_merge_by_distance':
       case 'fill_mesh':
+        disabled = workMode !== 'edit' || !hasSelectedComponents;
+        break;
       case 'select_all':
         disabled = workMode !== 'edit';
         break;
@@ -406,7 +408,7 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
         break;
       case 'toggle_shift_modifier':
         active = screenShiftActive;
-        disabled = workMode !== 'edit';
+        disabled = false;
         break;
       case 'work_object':
         active = workMode === 'object';
@@ -1198,7 +1200,7 @@ export const FloatingRadialMenu: React.FC<FloatingRadialMenuProps> = ({
                     className="h-8 px-2 rounded-lg bg-[#21242c] hover:bg-[#2c313b] disabled:opacity-35 disabled:pointer-events-none border border-[#303542] text-[11px] font-medium text-[#e4e6eb] flex items-center gap-1 touch-manipulation"
                   >
                     <PaintBucket className="w-3.5 h-3.5 text-[#ff9900]" />
-                    <span>Rellenar</span>
+                    <span>Crear cara</span>
                   </button>
                   <button
                     type="button"

@@ -7,7 +7,11 @@ import {
   SerializedEditableMesh,
   Vec3,
 } from '../core/mesh/EditableMesh';
-import { EditSelectionMode, applyTransformToVertices } from '../core/mesh/operations';
+import {
+  EditSelectionMode,
+  applyTransformToVertices,
+  computeDerivedEditSelection,
+} from '../core/mesh/operations';
 import {
   AxisConstraint,
   CameraProjection,
@@ -353,18 +357,33 @@ export class ViewportEngine {
     this.scene.add(rimLight);
 
     // Subtle ground shadow receiver on XY plane (Z-up floor)
+    const shadowMat = new THREE.ShadowMaterial({ opacity: 0.22 });
+    shadowMat.depthTest = true;
+    shadowMat.depthWrite = false;
     this.shadowPlane = new THREE.Mesh(
       new THREE.PlaneGeometry(60, 60),
-      new THREE.ShadowMaterial({ opacity: 0.22 }),
+      shadowMat,
     );
     this.shadowPlane.position.set(0, 0, -0.004);
     this.shadowPlane.receiveShadow = true;
+    this.shadowPlane.renderOrder = -3;
     this.scene.add(this.shadowPlane);
 
-    // Reference Grid rotated onto XY plane (Z = 0)
+    // Reference Grid rotated onto XY plane (Z = 0) — visual guide only, never writes depth
     this.gridHelper = new THREE.GridHelper(32, 32, 0x3f444f, 0x2a2d35);
+    const gridMaterials = Array.isArray(this.gridHelper.material)
+      ? this.gridHelper.material
+      : [this.gridHelper.material];
+    for (const mat of gridMaterials) {
+      mat.transparent = true;
+      mat.opacity = 0.85;
+      mat.depthTest = true;
+      mat.depthWrite = false;
+      mat.needsUpdate = true;
+    }
     this.gridHelper.rotation.x = Math.PI / 2;
     this.gridHelper.position.set(0, 0, -0.001);
+    this.gridHelper.renderOrder = -2;
     this.scene.add(this.gridHelper);
 
     // Colored X, Y, Z Axes
@@ -381,30 +400,33 @@ export class ViewportEngine {
       new THREE.LineBasicMaterial({
         color: 0x111317,
         depthTest: true,
+        depthWrite: false,
         transparent: true,
         opacity: 0.85,
       }),
     );
-    this.editAllEdgesLine.renderOrder = 2;
+    this.editAllEdgesLine.renderOrder = 4;
 
     this.editSelectedEdgesLine = new THREE.LineSegments(
       new THREE.BufferGeometry(),
       new THREE.LineBasicMaterial({
         color: 0xff9900,
         depthTest: false,
+        depthWrite: false,
       }),
     );
-    this.editSelectedEdgesLine.renderOrder = 4;
+    this.editSelectedEdgesLine.renderOrder = 5;
 
     const barGeo = new THREE.BoxGeometry(1, 1, 1);
     const barMat = new THREE.MeshBasicMaterial({
       color: 0xff9900,
       depthTest: false,
+      depthWrite: false,
     });
     this.editSelectedEdgeBars = new THREE.InstancedMesh(barGeo, barMat, 1);
     this.editSelectedEdgeBars.count = 0;
     this.editSelectedEdgeBars.frustumCulled = false;
-    this.editSelectedEdgeBars.renderOrder = 4;
+    this.editSelectedEdgeBars.renderOrder = 5;
 
     this.editSelectedFacesMesh = new THREE.Mesh(
       new THREE.BufferGeometry(),
@@ -413,13 +435,14 @@ export class ViewportEngine {
         transparent: true,
         opacity: 0.42,
         side: THREE.DoubleSide,
+        depthTest: true,
         depthWrite: false,
         polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -1,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
       }),
     );
-    this.editSelectedFacesMesh.renderOrder = 1;
+    this.editSelectedFacesMesh.renderOrder = 3;
 
     this.editUnselectedVerticesPoints = new THREE.Points(
       new THREE.BufferGeometry(),
@@ -430,9 +453,10 @@ export class ViewportEngine {
         map: this.vertexDotTexture,
         alphaTest: 0.45,
         depthTest: true,
+        depthWrite: false,
       }),
     );
-    this.editUnselectedVerticesPoints.renderOrder = 5;
+    this.editUnselectedVerticesPoints.renderOrder = 6;
 
     this.editSelectedVerticesPoints = new THREE.Points(
       new THREE.BufferGeometry(),
@@ -443,18 +467,20 @@ export class ViewportEngine {
         map: this.vertexDotTexture,
         alphaTest: 0.45,
         depthTest: false,
+        depthWrite: false,
       }),
     );
-    this.editSelectedVerticesPoints.renderOrder = 6;
+    this.editSelectedVerticesPoints.renderOrder = 7;
 
     const loopBarMat = new THREE.MeshBasicMaterial({
       color: 0x38bdf8,
       depthTest: false,
+      depthWrite: false,
     });
     this.loopCutPreviewBars = new THREE.InstancedMesh(barGeo, loopBarMat, 1);
     this.loopCutPreviewBars.count = 0;
     this.loopCutPreviewBars.frustumCulled = false;
-    this.loopCutPreviewBars.renderOrder = 7;
+    this.loopCutPreviewBars.renderOrder = 8;
 
     this.editOverlayGroup.add(
       this.editSelectedFacesMesh,
@@ -517,10 +543,8 @@ export class ViewportEngine {
         this.workMode === 'object'
           ? this.hitTestObject(clientX, clientY, pointerType) !== null
           : this.hitTestEditComponent(clientX, clientY, pointerType) !== null,
-      onSingleTap: (clientX, clientY, pointerType, modifiers) => {
-        const keyboardShift =
-          window.event instanceof MouseEvent && window.event.shiftKey;
-        const shiftActive = modifiers.shift || keyboardShift;
+      onSingleTap: (clientX, clientY, pointerType, modifiers, shiftKey) => {
+        const shiftActive = modifiers.shift || shiftKey;
         const additive =
           Boolean(this.settings?.multiSelectTouch) || shiftActive;
         this.performTapSelection(
@@ -528,7 +552,7 @@ export class ViewportEngine {
           clientY,
           pointerType,
           additive,
-          modifiers.shift,
+          false,
         );
       },
       onTwoFingerTap: () => {
@@ -544,14 +568,14 @@ export class ViewportEngine {
       onLongPress: (clientX, clientY, pointerType) => {
         this.handleLongPressContext(clientX, clientY, pointerType);
       },
-      onBoxSelectStart: (rect, modifiers) => {
-        this.handleBoxSelectMove(rect, modifiers);
+      onBoxSelectStart: (rect, modifiers, shiftKey) => {
+        this.handleBoxSelectMove(rect, modifiers, shiftKey);
       },
-      onBoxSelectMove: (rect, modifiers) => {
-        this.handleBoxSelectMove(rect, modifiers);
+      onBoxSelectMove: (rect, modifiers, shiftKey) => {
+        this.handleBoxSelectMove(rect, modifiers, shiftKey);
       },
-      onBoxSelectEnd: (rect, modifiers) => {
-        this.handleBoxSelectEnd(rect, modifiers);
+      onBoxSelectEnd: (rect, modifiers, shiftKey) => {
+        this.handleBoxSelectEnd(rect, modifiers, shiftKey);
       },
       onBoxSelectCancel: () => {
         this.clearBoxSelectPreview();
@@ -615,6 +639,7 @@ export class ViewportEngine {
 
   private createAxesGroup(): THREE.Group {
     const group = new THREE.Group();
+    group.renderOrder = -2;
     const len = 16;
 
     const makeAxis = (dir: Vec3, color: number) => {
@@ -626,8 +651,12 @@ export class ViewportEngine {
         color,
         transparent: true,
         opacity: 0.72,
+        depthTest: true,
+        depthWrite: false,
       });
-      return new THREE.Line(geo, mat);
+      const line = new THREE.Line(geo, mat);
+      line.renderOrder = -2;
+      return line;
     };
 
     group.add(makeAxis([1, 0, 0], 0xe05252)); // X Red
@@ -878,13 +907,14 @@ export class ViewportEngine {
     return null;
   }
 
-  private isBoxSelectAdditive(modifiers: TouchModifierState): boolean {
-    const keyboardShift =
-      window.event instanceof MouseEvent && window.event.shiftKey;
+  private isBoxSelectAdditive(
+    modifiers: TouchModifierState,
+    shiftKey = false,
+  ): boolean {
     return (
       Boolean(this.settings?.multiSelectTouch) ||
       modifiers.shift ||
-      keyboardShift
+      shiftKey
     );
   }
 
@@ -1217,8 +1247,9 @@ export class ViewportEngine {
   private handleBoxSelectMove(
     rect: BoxSelectRect,
     modifiers: TouchModifierState,
+    shiftKey = false,
   ): void {
-    const additive = this.isBoxSelectAdditive(modifiers);
+    const additive = this.isBoxSelectAdditive(modifiers, shiftKey);
     const { overlay } = this.toCanvasBoxRect(rect);
 
     if (this.workMode === 'object') {
@@ -1247,8 +1278,9 @@ export class ViewportEngine {
   private handleBoxSelectEnd(
     rect: BoxSelectRect,
     modifiers: TouchModifierState,
+    shiftKey = false,
   ): void {
-    const additive = this.isBoxSelectAdditive(modifiers);
+    const additive = this.isBoxSelectAdditive(modifiers, shiftKey);
     const ids =
       this.workMode === 'object'
         ? this.queryObjectsInBox(rect)
@@ -1739,7 +1771,8 @@ export class ViewportEngine {
       }
       wireMat.opacity = isSelected ? 1 : 0.86;
       wireMat.depthTest = true;
-      visual.wireEdges.renderOrder = isSelected ? 2 : 1;
+      wireMat.depthWrite = false;
+      visual.wireEdges.renderOrder = isSelected ? 4 : 1;
     } else if (isXray) {
       visual.wireEdges.visible = true;
       wireMat.color.setHex(
@@ -1752,19 +1785,22 @@ export class ViewportEngine {
       }
       wireMat.opacity = isSelected ? 1 : visual.hasFaces ? 0.55 : 1;
       wireMat.depthTest = !isSelected && visual.hasFaces;
-      visual.wireEdges.renderOrder = isSelected ? 2 : 1;
+      wireMat.depthWrite = false;
+      visual.wireEdges.renderOrder = isSelected ? 4 : 1;
     } else {
       visual.wireEdges.visible = !visual.hasFaces || isSelected;
       wireMat.color.setHex(
         !visual.hasFaces ? (isSelected ? 0xff9900 : 0xc0c6d0) : 0xff9900,
       );
-      if (wireMat.transparent) {
-        wireMat.transparent = false;
+      const wireTransparent = isSelected;
+      if (wireMat.transparent !== wireTransparent) {
+        wireMat.transparent = wireTransparent;
         wireMat.needsUpdate = true;
       }
       wireMat.opacity = 1;
       wireMat.depthTest = true;
-      visual.wireEdges.renderOrder = 1;
+      wireMat.depthWrite = !isSelected;
+      visual.wireEdges.renderOrder = isSelected ? 4 : 1;
     }
   }
 
@@ -1857,25 +1893,29 @@ export class ViewportEngine {
       this.editOverlaySourceMesh = mesh;
     }
 
-    // Highlight selected + live box-select preview components in Edit Mode
+    // Highlight selected + live box-select preview components in Edit Mode,
+    // including coherent topology-derived edges, faces, and corner vertices
     const activeComponentIds = new Set<string>(this.selectedComponentIds);
     for (const id of this.boxSelectPreviewComponentIds) {
       activeComponentIds.add(id);
     }
+    const derived = computeDerivedEditSelection(
+      mesh,
+      this.editSelectionMode,
+      activeComponentIds,
+    );
 
-    // 2. Selected Edges
+    // 2. Selected + Derived Edges
     const selEdgeCoords: number[] = [];
     const selEdgePairs: { a: Vec3; b: Vec3 }[] = [];
-    if (this.editSelectionMode === 'edge') {
-      for (const eid of activeComponentIds) {
-        const edge = mesh.getEdge(eid);
-        if (!edge) continue;
-        const v0 = mesh.getVertex(edge.v0);
-        const v1 = mesh.getVertex(edge.v1);
-        if (!v0 || !v1) continue;
-        selEdgeCoords.push(...v0.position, ...v1.position);
-        selEdgePairs.push({ a: v0.position, b: v1.position });
-      }
+    for (const eid of derived.edgeIds) {
+      const edge = mesh.getEdge(eid);
+      if (!edge) continue;
+      const v0 = mesh.getVertex(edge.v0);
+      const v1 = mesh.getVertex(edge.v1);
+      if (!v0 || !v1) continue;
+      selEdgeCoords.push(...v0.position, ...v1.position);
+      selEdgePairs.push({ a: v0.position, b: v1.position });
     }
     const selEdgeGeo = new THREE.BufferGeometry();
     selEdgeGeo.setAttribute(
@@ -1897,7 +1937,7 @@ export class ViewportEngine {
           Math.max(16, selEdgePairs.length * 2),
         );
         nextBar.frustumCulled = false;
-        nextBar.renderOrder = 4;
+        nextBar.renderOrder = 5;
         this.editSelectedEdgeBars = nextBar;
         this.editOverlayGroup.add(nextBar);
       }
@@ -1929,12 +1969,12 @@ export class ViewportEngine {
       this.editSelectedEdgeBars.visible = false;
     }
 
-    // 3. Selected Faces Overlay
+    // 3. Selected + Derived Faces Overlay
     const selFacePositions: number[] = [];
-    if (this.editSelectionMode === 'face' && activeComponentIds.size > 0) {
+    if (derived.faceIds.size > 0) {
       const solidPos = visual.solidMesh.geometry.getAttribute('position');
       if (solidPos) {
-        for (const fid of activeComponentIds) {
+        for (const fid of derived.faceIds) {
           const range = visual.faceToTriangleRange.get(fid);
           if (!range) continue;
           const startVert = range.start * 3;
@@ -1962,18 +2002,16 @@ export class ViewportEngine {
     selFacesMat.depthTest = !xray;
     selFacesMat.opacity = isWireframe ? 0.28 : isXrayMode ? 0.36 : 0.42;
 
-    // 4. Vertices Points (prominent in vertex mode)
-    const showVertices = this.editSelectionMode === 'vertex';
+    // 4. Vertices Points (unselected only in vertex mode; derived endpoints/corners highlighted coherently)
+    const showUnselectedVertices = this.editSelectionMode === 'vertex';
     const unselVerts: number[] = [];
     const selVerts: number[] = [];
 
-    if (showVertices) {
-      for (const v of mesh.vertices) {
-        if (activeComponentIds.has(v.id)) {
-          selVerts.push(...v.position);
-        } else {
-          unselVerts.push(...v.position);
-        }
+    for (const v of mesh.vertices) {
+      if (derived.vertexIds.has(v.id)) {
+        selVerts.push(...v.position);
+      } else if (showUnselectedVertices) {
+        unselVerts.push(...v.position);
       }
     }
 
@@ -1985,13 +2023,17 @@ export class ViewportEngine {
       .material as THREE.PointsMaterial;
     unselVertMat.depthTest = !xray;
     unselVertMat.color.setHex(highContrastLight ? 0xdbe2ec : 0x121418);
-    this.editUnselectedVerticesPoints.visible = showVertices && unselVerts.length > 0;
+    this.editUnselectedVerticesPoints.visible =
+      showUnselectedVertices && unselVerts.length > 0;
 
     const selVertGeo = new THREE.BufferGeometry();
     selVertGeo.setAttribute('position', new THREE.Float32BufferAttribute(selVerts, 3));
     this.editSelectedVerticesPoints.geometry.dispose();
     this.editSelectedVerticesPoints.geometry = selVertGeo;
-    this.editSelectedVerticesPoints.visible = showVertices && selVerts.length > 0;
+    const selVertMat = this.editSelectedVerticesPoints
+      .material as THREE.PointsMaterial;
+    selVertMat.size = this.editSelectionMode === 'vertex' ? 14 : 11;
+    this.editSelectedVerticesPoints.visible = selVerts.length > 0;
 
     // 5. Loop Cut Preview Ring Bars
     if (this.loopCutPreviewMode && this.loopCutPreviewSegments.length > 0) {
@@ -2005,7 +2047,7 @@ export class ViewportEngine {
           Math.max(32, segs.length * 2),
         );
         nextLoop.frustumCulled = false;
-        nextLoop.renderOrder = 7;
+        nextLoop.renderOrder = 8;
         this.loopCutPreviewBars = nextLoop;
         this.editOverlayGroup.add(nextLoop);
       }

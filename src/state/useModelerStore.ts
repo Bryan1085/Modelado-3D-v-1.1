@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EditableMesh, Vec3 } from '../core/mesh/EditableMesh';
 import {
+  computeDerivedEditSelection,
   deleteSelectedComponents,
   EditSelectionMode,
   selectAllComponents,
@@ -310,7 +311,6 @@ export function useModelerStore() {
       setWorkMode(prev.workMode);
       setEditSelectionMode(prev.editSelectionMode);
       setSelectedComponentIds(new Set(prev.selectedComponentIds));
-      if (prev.workMode !== 'edit') setScreenShiftActive(false);
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
       setHistoryVersion((v) => v + 1);
@@ -343,7 +343,6 @@ export function useModelerStore() {
       setWorkMode(next.workMode);
       setEditSelectionMode(next.editSelectionMode);
       setSelectedComponentIds(new Set(next.selectedComponentIds));
-      if (next.workMode !== 'edit') setScreenShiftActive(false);
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
       setHistoryVersion((v) => v + 1);
@@ -509,13 +508,13 @@ export function useModelerStore() {
 
   const selectObject = useCallback(
     (id: string | null, additive = false) => {
+      const effectiveAdditive = additive || screenShiftActive;
       setOperatorSession(null);
       if (workMode === 'edit' && id !== selectedObjectId) {
         setWorkMode('object');
-        setScreenShiftActive(false);
         setSelectedComponentIds(new Set());
       }
-      if (additive) {
+      if (effectiveAdditive) {
         if (id === null) return;
         const next = new Set(selectedObjectIds);
         if (next.has(id)) {
@@ -536,13 +535,20 @@ export function useModelerStore() {
       }
       setSingleSelectedObject(id);
     },
-    [selectedObjectId, selectedObjectIds, setSingleSelectedObject, workMode],
+    [
+      screenShiftActive,
+      selectedObjectId,
+      selectedObjectIds,
+      setSingleSelectedObject,
+      workMode,
+    ],
   );
 
   const selectObjectsFromBox = useCallback(
     (ids: string[], additive: boolean) => {
+      const effectiveAdditive = additive || screenShiftActive;
       setOperatorSession(null);
-      const next = new Set<string>(additive ? selectedObjectIds : []);
+      const next = new Set<string>(effectiveAdditive ? selectedObjectIds : []);
       for (const id of ids) next.add(id);
 
       let nextPrimary: string | null = null;
@@ -557,17 +563,16 @@ export function useModelerStore() {
 
       if (workMode === 'edit' && nextPrimary !== selectedObjectId) {
         setWorkMode('object');
-        setScreenShiftActive(false);
         setSelectedComponentIds(new Set());
       }
       setSelectedObjectIds(next);
       setSelectedObjectId(nextPrimary);
     },
-    [selectedObjectId, selectedObjectIds, workMode],
+    [screenShiftActive, selectedObjectId, selectedObjectIds, workMode],
   );
 
   const selectObjectInScene = useCallback(
-    (sceneId: string, objectId: string) => {
+    (sceneId: string, objectId: string, additive = false) => {
       setOperatorSession(null);
       if (sceneId !== project.activeSceneId) {
         setProject((p) => switchSceneInProject(p, sceneId));
@@ -575,14 +580,12 @@ export function useModelerStore() {
         setScreenShiftActive(false);
         setSelectedComponentIds(new Set());
         setMeshRevision((r) => r + 1);
-      } else if (workMode === 'edit' && objectId !== selectedObjectId) {
-        setWorkMode('object');
-        setScreenShiftActive(false);
-        setSelectedComponentIds(new Set());
+        setSingleSelectedObject(objectId);
+        return;
       }
-      setSingleSelectedObject(objectId);
+      selectObject(objectId, additive);
     },
-    [project.activeSceneId, selectedObjectId, setSingleSelectedObject, workMode],
+    [project.activeSceneId, selectObject, setSingleSelectedObject],
   );
 
   const toggleWorkMode = useCallback(
@@ -607,7 +610,6 @@ export function useModelerStore() {
         }
         setSelectedComponentIds(new Set());
       } else {
-        setScreenShiftActive(false);
         setSelectedComponentIds(new Set());
       }
       setWorkMode(nextMode);
@@ -615,11 +617,31 @@ export function useModelerStore() {
     [selectedObject, showToast],
   );
 
-  const changeEditSelectionMode = useCallback((mode: EditSelectionMode) => {
-    setOperatorSession(null);
-    setEditSelectionMode(mode);
-    setSelectedComponentIds(new Set());
-  }, []);
+  const changeEditSelectionMode = useCallback(
+    (mode: EditSelectionMode) => {
+      setOperatorSession(null);
+      if (mode === editSelectionMode) return;
+      if (selectedObject && selectedComponentIds.size > 0) {
+        const mesh = EditableMesh.fromJSON(selectedObject.mesh);
+        const derived = computeDerivedEditSelection(
+          mesh,
+          editSelectionMode,
+          selectedComponentIds,
+        );
+        const converted =
+          mode === 'vertex'
+            ? derived.vertexIds
+            : mode === 'edge'
+              ? derived.edgeIds
+              : derived.faceIds;
+        setSelectedComponentIds(new Set(converted));
+      } else {
+        setSelectedComponentIds(new Set());
+      }
+      setEditSelectionMode(mode);
+    },
+    [editSelectionMode, selectedComponentIds, selectedObject],
+  );
 
   const updateObjectTransform = useCallback(
     (objectId: string, transform: ObjectTransform, recordHistory = true) => {
@@ -1414,10 +1436,9 @@ export function useModelerStore() {
   const selectComponentFromViewport = useCallback(
     (id: string | null, additive: boolean, addOnly = false) => {
       if (operatorSession) return;
-      const effectiveAddOnly = addOnly || screenShiftActive;
       const effectiveAdditive = additive || screenShiftActive;
       setSelectedComponentIds((prev) =>
-        applyComponentSelection(prev, id, effectiveAdditive, effectiveAddOnly),
+        applyComponentSelection(prev, id, effectiveAdditive, addOnly),
       );
     },
     [operatorSession, screenShiftActive],
@@ -2063,18 +2084,28 @@ export function useModelerStore() {
       return;
     }
     if (selectedComponentIds.size === 0) {
-      showToast('Selecciona al menos 2 vértices o aristas para rellenar');
+      showToast('Selecciona al menos 2 vértices o aristas para crear geometría');
       return;
     }
     setOperatorSession(null);
     const mesh = EditableMesh.fromJSON(selectedObject.mesh);
-    const { result, message } = fillMesh(
-      mesh,
-      editSelectionMode,
-      selectedComponentIds,
-    );
-    if (message) {
-      showToast(message);
+    const {
+      result,
+      nextMode,
+      selectExisting,
+      message,
+      error,
+    } = fillMesh(mesh, editSelectionMode, selectedComponentIds);
+    if (error) {
+      showToast(error);
+      return;
+    }
+    if (selectExisting) {
+      if (nextMode && nextMode !== editSelectionMode) {
+        setEditSelectionMode(nextMode);
+      }
+      setSelectedComponentIds(result.nextSelectedIds);
+      if (message) showToast(message);
       return;
     }
     pushHistory(makeSnapshot());
@@ -2088,10 +2119,13 @@ export function useModelerStore() {
         ),
       })),
     );
+    if (nextMode && nextMode !== editSelectionMode) {
+      setEditSelectionMode(nextMode);
+    }
     setSelectedComponentIds(result.nextSelectedIds);
     setHasUnsavedChanges(true);
     setMeshRevision((r) => r + 1);
-    showToast('Geometría rellenada');
+    showToast(message ?? 'Geometría creada');
   }, [
     editSelectionMode,
     makeSnapshot,

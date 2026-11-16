@@ -100,3 +100,103 @@ export function selectAllComponents(
   if (mode === 'edge') return new Set(mesh.edges.map((e) => e.id));
   return new Set(mesh.faces.map((f) => f.id));
 }
+
+export interface DerivedEditSelection {
+  vertexIds: Set<string>;
+  edgeIds: Set<string>;
+  faceIds: Set<string>;
+}
+
+/**
+ * Derives coherent topological selection highlights (without mutating geometry or
+ * inferring non-existent edges) from the user's primary selection in the active sub-mode.
+ */
+export function computeDerivedEditSelection(
+  mesh: EditableMesh,
+  mode: EditSelectionMode,
+  selectedIds: ReadonlySet<string>,
+): DerivedEditSelection {
+  const vertexIds = new Set<string>();
+  const edgeIds = new Set<string>();
+  const faceIds = new Set<string>();
+
+  if (selectedIds.size === 0) {
+    return { vertexIds, edgeIds, faceIds };
+  }
+
+  if (mode === 'vertex') {
+    for (const id of selectedIds) {
+      if (mesh.getVertex(id)) {
+        vertexIds.add(id);
+      }
+    }
+    if (vertexIds.size >= 2) {
+      for (const edge of mesh.edges) {
+        if (vertexIds.has(edge.v0) && vertexIds.has(edge.v1)) {
+          edgeIds.add(edge.id);
+        }
+      }
+    }
+    if (vertexIds.size >= 3) {
+      for (const face of mesh.faces) {
+        if (
+          face.vertexIds.length >= 3 &&
+          face.vertexIds.every((vid) => vertexIds.has(vid))
+        ) {
+          faceIds.add(face.id);
+        }
+      }
+    }
+    return { vertexIds, edgeIds, faceIds };
+  }
+
+  if (mode === 'edge') {
+    for (const id of selectedIds) {
+      const edge = mesh.getEdge(id);
+      if (edge) {
+        edgeIds.add(edge.id);
+        vertexIds.add(edge.v0);
+        vertexIds.add(edge.v1);
+      }
+    }
+    if (edgeIds.size >= 3) {
+      for (const face of mesh.faces) {
+        const n = face.vertexIds.length;
+        if (n < 3) continue;
+        let allEdgesSelected = true;
+        for (let i = 0; i < n; i++) {
+          const eid = mesh.findEdgeId(
+            face.vertexIds[i],
+            face.vertexIds[(i + 1) % n],
+          );
+          if (!eid || !edgeIds.has(eid)) {
+            allEdgesSelected = false;
+            break;
+          }
+        }
+        if (allEdgesSelected) {
+          faceIds.add(face.id);
+        }
+      }
+    }
+    return { vertexIds, edgeIds, faceIds };
+  }
+
+  // mode === 'face'
+  for (const id of selectedIds) {
+    const face = mesh.getFace(id);
+    if (!face) continue;
+    faceIds.add(face.id);
+    for (const vid of face.vertexIds) {
+      if (mesh.getVertex(vid)) {
+        vertexIds.add(vid);
+      }
+    }
+    for (const eid of mesh.getEdgesForFace(face.id)) {
+      edgeIds.add(eid);
+    }
+  }
+
+  return { vertexIds, edgeIds, faceIds };
+}
+

@@ -253,7 +253,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
         onSelectComponent(
           info.hitComponentId,
           Boolean(settings.multiSelectTouch || screenShiftActive),
-          screenShiftActive,
+          false,
         );
       }
       setContextMenu({
@@ -385,9 +385,6 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
 
   useEffect(() => {
     setContextMenu(null);
-    if (workMode !== 'edit') {
-      setGestureModifiers(EMPTY_MODIFIER_STATE);
-    }
   }, [workMode, operatorSession]);
 
   const editSelectionDetails = useMemo(() => {
@@ -405,10 +402,8 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
     return { vertexCount: verts.size, canInset };
   }, [editSelectionMode, selectedComponentIds, selectedObject, workMode]);
 
-  const shiftActive =
-    workMode === 'edit' && (gestureModifiers.shift || screenShiftActive);
+  const shiftActive = gestureModifiers.shift || screenShiftActive;
   const showScreenShiftBtn =
-    workMode === 'edit' &&
     settings.touch.modifiers.shift.enabled &&
     settings.touch.modifiers.shift.showScreenButton;
 
@@ -480,7 +475,7 @@ export const Viewport3D = React.forwardRef<Viewport3DHandle, Viewport3DProps>(
                     ? 'bg-[#2a1f10] border-[#ff9900] text-[#ffb84d]'
                     : 'bg-[#181a1f]/95 border-[#2f333d] text-[#b4bac4] hover:text-white'
                 }`}
-                title="Alternar modificador SHIFT en pantalla para sumar elementos"
+                title="Alternar modificador SHIFT en pantalla para agregar o quitar elementos de la selección"
               >
                 <ArrowBigUpDash className="w-3.5 h-3.5" />
                 <span>SHIFT</span>

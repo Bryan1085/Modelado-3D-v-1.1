@@ -342,6 +342,69 @@ export class EditableMesh {
     if (n < 3) return [];
     if (n === 3) return [[0, 1, 2]];
     if (n === 4) {
+      const p0 = this.vertexMap.get(face.vertexIds[0])?.position;
+      const p1 = this.vertexMap.get(face.vertexIds[1])?.position;
+      const p2 = this.vertexMap.get(face.vertexIds[2])?.position;
+      const p3 = this.vertexMap.get(face.vertexIds[3])?.position;
+      if (!p0 || !p1 || !p2 || !p3) return [];
+
+      // Check convexity along Newell face normal to handle concave or twisted quads cleanly
+      const fn = this.computeFaceNormal(face);
+      const pts4 = [p0, p1, p2, p3];
+      const turns: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        const a = pts4[(i + 3) % 4];
+        const b = pts4[i];
+        const c = pts4[(i + 1) % 4];
+        const abx = b[0] - a[0];
+        const aby = b[1] - a[1];
+        const abz = b[2] - a[2];
+        const bcx = c[0] - b[0];
+        const bcy = c[1] - b[1];
+        const bcz = c[2] - b[2];
+        const cx = aby * bcz - abz * bcy;
+        const cy = abz * bcx - abx * bcz;
+        const cz = abx * bcy - aby * bcx;
+        turns.push(cx * fn[0] + cy * fn[1] + cz * fn[2]);
+      }
+
+      // If corner 1 or 3 is reflex (negative turn while majority positive), split [1, 3]
+      if ((turns[1] < -1e-6 || turns[3] < -1e-6) && turns[0] > 1e-6 && turns[2] > 1e-6) {
+        return [
+          [1, 2, 3],
+          [1, 3, 0],
+        ];
+      }
+      if ((turns[0] < -1e-6 || turns[2] < -1e-6) && turns[1] > 1e-6 && turns[3] > 1e-6) {
+        return [
+          [0, 1, 2],
+          [0, 2, 3],
+        ];
+      }
+
+      // For non-coplanar quads, pick the shorter diagonal when significantly warped
+      const d02 = Math.hypot(p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]);
+      const d13 = Math.hypot(p3[0] - p1[0], p3[1] - p1[1], p3[2] - p1[2]);
+      const nA = [
+        (p1[1] - p0[1]) * (p2[2] - p0[2]) - (p1[2] - p0[2]) * (p2[1] - p0[1]),
+        (p1[2] - p0[2]) * (p2[0] - p0[0]) - (p1[0] - p0[0]) * (p2[2] - p0[2]),
+        (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]),
+      ];
+      const nALen = Math.hypot(nA[0], nA[1], nA[2]) || 1;
+      const dist3 =
+        Math.abs(
+          ((p3[0] - p0[0]) * nA[0] +
+            (p3[1] - p0[1]) * nA[1] +
+            (p3[2] - p0[2]) * nA[2]) /
+            nALen,
+        );
+      if (dist3 > 1e-4 && d13 < d02 * 0.99) {
+        return [
+          [1, 2, 3],
+          [1, 3, 0],
+        ];
+      }
+
       return [
         [0, 1, 2],
         [0, 2, 3],

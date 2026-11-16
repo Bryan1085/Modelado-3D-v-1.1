@@ -61,7 +61,11 @@ interface OutlinerPanelProps {
   selectedComponentIds: Set<string>;
   liveTransformOverride: { id: string; transform: ObjectTransform } | null;
   onSelectObject: (id: string) => void;
-  onSelectObjectInScene: (sceneId: string, objectId: string) => void;
+  onSelectObjectInScene: (
+    sceneId: string,
+    objectId: string,
+    additive?: boolean,
+  ) => void;
   onRenameObject: (id: string, name: string) => void;
   onDuplicateObject: (id: string) => void;
   onToggleVisibility: (id: string) => void;
@@ -607,7 +611,9 @@ export const OutlinerPanel: React.FC<OutlinerPanelProps> = ({
                   onPointerMove={handleRowPointerMoveForLongPress}
                   onPointerUp={clearLongPress}
                   onPointerCancel={clearLongPress}
-                  onClick={() => onSelectObjectInScene(scene.id, obj.id)}
+                  onClick={(e) =>
+                    onSelectObjectInScene(scene.id, obj.id, e.shiftKey)
+                  }
                   style={{ paddingLeft: `${26 + depth * 12}px` }}
                   className={`min-h-[40px] pr-1 rounded-md flex items-center justify-between gap-1 cursor-pointer transition-colors ${
                     isBeingDragged
