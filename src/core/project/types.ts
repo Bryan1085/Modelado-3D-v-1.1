@@ -13,15 +13,8 @@ export interface ObjectTransform {
   scale: Vec3;
 }
 
-/**
- * Future-ready modifier and material slots per object.
- */
-export interface ModifierSlot {
-  id: string;
-  type: string;
-  enabled: boolean;
-  params: Record<string, unknown>;
-}
+import type { ModifierSlot } from '../modifiers/types';
+export type { ModifierSlot, ModifierType } from '../modifiers/types';
 
 export interface MaterialSlot {
   color: string;

@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { createCubeMesh } from '../mesh/primitives';
+import { normalizeModifierSlot } from '../modifiers/types';
 import {
   CollectionData,
+  ModifierSlot,
   ObjectTransform,
   ProjectData,
   ReferenceImageData,
@@ -397,7 +399,16 @@ export function normalizeProjectHierarchy(raw: unknown): ProjectData | null {
                   : fallbackColId,
               visible: typeof o.visible === 'boolean' ? o.visible : true,
               locked: typeof o.locked === 'boolean' ? o.locked : false,
-              modifiers: Array.isArray(o.modifiers) ? o.modifiers : [],
+              modifiers: Array.isArray(o.modifiers)
+                ? o.modifiers
+                    .map((mod, mIdx) =>
+                      normalizeModifierSlot(
+                        mod,
+                        createHierarchyId(`mod_${mIdx}`),
+                      ),
+                    )
+                    .filter((m): m is ModifierSlot => m !== null)
+                : [],
               ...(migratedRef ? { referenceImage: migratedRef } : {}),
             };
           })

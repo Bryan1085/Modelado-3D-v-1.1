@@ -25,6 +25,17 @@ import {
 } from '../core/project/types';
 import { DEFAULT_TOUCH_SETTINGS } from '../core/project/storage';
 import {
+  buildTransformRefsFromObjects,
+  evaluateObjectModifiers,
+  hasActiveViewportModifiers,
+} from '../core/modifiers/evaluateModifiers';
+import { clampVerticesForMirrorClipping } from '../core/modifiers/mirrorModifier';
+import {
+  ModifierSlot,
+  ModifierTransformRef,
+  normalizeMirrorParams,
+} from '../core/modifiers/types';
+import {
   BoxSelectRect,
   EMPTY_MODIFIER_STATE,
   TouchGestureManager,
@@ -125,13 +136,20 @@ interface ObjectVisual {
   group: THREE.Group;
   solidMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
   wireEdges: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>;
+  baseSolidCollider: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
   refPlaneMesh: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null;
   refTexture: THREE.Texture | null;
   refImageSrc: string | null;
   triangleToFaceId: string[];
   faceToTriangleRange: Map<string, { start: number; count: number }>;
+  baseTriangleToFaceId: string[];
+  baseFaceToTriangleRange: Map<string, { start: number; count: number }>;
+  baseEditableMesh: EditableMesh;
   editableMesh: EditableMesh;
   lastMeshData: SerializedEditableMesh | null;
+  modifiers: ModifierSlot[];
+  modifiersSignature: string;
+  hasActiveModifiers: boolean;
   hasFaces: boolean;
   locked: boolean;
 }
@@ -260,7 +278,9 @@ export class ViewportEngine {
   private objectDragStartTransform: ObjectTransform | null = null;
   private editDragStartMesh: EditableMesh | null = null;
   private editDragStartVertexIds = new Set<string>();
+  private editDragStartVertexPositions = new Map<string, Vec3>();
   private editDragStartAnchorInv = new THREE.Matrix4();
+  private sceneTransformRefs: ModifierTransformRef[] = [];
 
   // Centralized Touch & Pointer Gesture Manager
   private gestureManager: TouchGestureManager;
@@ -788,6 +808,16 @@ export class ViewportEngine {
     return bestHit ? bestHit.id : null;
   }
 
+  private getEditBaseCollider(visual: ObjectVisual): THREE.Mesh | null {
+    if (visual.baseEditableMesh.faces.length === 0) return null;
+    if (visual.hasActiveModifiers) {
+      visual.group.updateMatrixWorld(true);
+      visual.baseSolidCollider.matrixWorld.copy(visual.group.matrixWorld);
+      return visual.baseSolidCollider;
+    }
+    return visual.solidMesh;
+  }
+
   private hitTestEditComponent(
     clientX: number,
     clientY: number,
@@ -796,6 +826,9 @@ export class ViewportEngine {
     if (!this.selectedObjectId) return null;
     const visual = this.visuals.get(this.selectedObjectId);
     if (!visual) return null;
+
+    const baseMesh = visual.baseEditableMesh;
+    const baseCollider = this.getEditBaseCollider(visual);
 
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
@@ -806,10 +839,10 @@ export class ViewportEngine {
     this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.activeCamera);
 
     if (!this.loopCutPreviewMode && this.editSelectionMode === 'face') {
-      if (!visual.hasFaces) return null;
-      const hits = this.raycaster.intersectObject(visual.solidMesh, false);
+      if (!baseCollider) return null;
+      const hits = this.raycaster.intersectObject(baseCollider, false);
       if (hits.length > 0 && hits[0].faceIndex != null) {
-        return visual.triangleToFaceId[hits[0].faceIndex] ?? null;
+        return visual.baseTriangleToFaceId[hits[0].faceIndex] ?? null;
       }
       return null;
     }
@@ -821,15 +854,15 @@ export class ViewportEngine {
     visual.group.updateMatrixWorld(true);
 
     const isOccluded = (worldPoint: THREE.Vector3): boolean => {
-      if (xray || !visual.hasFaces) return false;
+      if (xray || !baseCollider) return false;
       const projected = _v2.copy(worldPoint).project(this.activeCamera);
       this.raycaster.setFromCamera(
         new THREE.Vector2(projected.x, projected.y),
         this.activeCamera,
       );
-      const targetDist = this.raycaster.ray.origin.distanceTo(worldPoint);
-      const hits = this.raycaster.intersectObject(visual.solidMesh, false);
-      if (hits.length > 0 && hits[0].distance < targetDist - 0.06) {
+      const distToPoint = this.raycaster.ray.origin.distanceTo(worldPoint);
+      const hits = this.raycaster.intersectObject(baseCollider, false);
+      if (hits.length > 0 && hits[0].distance < distToPoint - 0.06) {
         return true;
       }
       return false;
@@ -839,7 +872,7 @@ export class ViewportEngine {
       let bestId: string | null = null;
       let bestScore = Infinity;
 
-      for (const v of visual.editableMesh.vertices) {
+      for (const v of baseMesh.vertices) {
         _v0
           .set(v.position[0], v.position[1], v.position[2])
           .applyMatrix4(visual.group.matrixWorld);
@@ -867,9 +900,9 @@ export class ViewportEngine {
       let bestId: string | null = null;
       let bestScore = Infinity;
 
-      for (const edge of visual.editableMesh.edges) {
-        const va = visual.editableMesh.getVertex(edge.v0);
-        const vb = visual.editableMesh.getVertex(edge.v1);
+      for (const edge of baseMesh.edges) {
+        const va = baseMesh.getVertex(edge.v0);
+        const vb = baseMesh.getVertex(edge.v1);
         if (!va || !vb) continue;
 
         const wa = new THREE.Vector3(...va.position).applyMatrix4(
@@ -1078,17 +1111,18 @@ export class ViewportEngine {
     this.activeCamera.updateMatrixWorld(true);
     visual.group.updateMatrixWorld(true);
     const xray = this.isXraySelectionActive();
+    const baseCollider = this.getEditBaseCollider(visual);
 
     const isOccluded = (worldPoint: THREE.Vector3): boolean => {
-      if (xray || !visual.hasFaces) return false;
+      if (xray || !baseCollider) return false;
       const projected = _v2.copy(worldPoint).project(this.activeCamera);
       this.raycaster.setFromCamera(
         new THREE.Vector2(projected.x, projected.y),
         this.activeCamera,
       );
-      const targetDist = this.raycaster.ray.origin.distanceTo(worldPoint);
-      const hits = this.raycaster.intersectObject(visual.solidMesh, false);
-      return hits.length > 0 && hits[0].distance < targetDist - 0.06;
+      const distToPoint = this.raycaster.ray.origin.distanceTo(worldPoint);
+      const hits = this.raycaster.intersectObject(baseCollider, false);
+      return hits.length > 0 && hits[0].distance < distToPoint - 0.06;
     };
 
     const projectWorld = (wv: THREE.Vector3) => {
@@ -1101,7 +1135,7 @@ export class ViewportEngine {
     };
 
     const matched: string[] = [];
-    const mesh = visual.editableMesh;
+    const mesh = visual.baseEditableMesh;
 
     if (this.editSelectionMode === 'vertex') {
       for (const v of mesh.vertices) {
@@ -1133,7 +1167,7 @@ export class ViewportEngine {
         if (!pa.inFront && !pb.inFront) continue;
         if (!segmentIntersectsRect2D(pa, pb, canvasRect)) continue;
 
-        if (!xray && visual.hasFaces) {
+        if (!xray && baseCollider) {
           // Visible if midpoint or either visible endpoint inside rect is not occluded
           const mid = wa.clone().lerp(wb, 0.5);
           const aIn = pa.inFront && isPointInRect2D(pa, canvasRect);
@@ -1149,12 +1183,12 @@ export class ViewportEngine {
       return matched;
     }
 
-    if (this.editSelectionMode === 'face' && visual.hasFaces) {
-      const posAttr = visual.solidMesh.geometry.getAttribute('position');
+    if (this.editSelectionMode === 'face' && baseCollider) {
+      const posAttr = baseCollider.geometry.getAttribute('position');
       if (!posAttr) return [];
 
       for (const face of mesh.faces) {
-        const range = visual.faceToTriangleRange.get(face.id);
+        const range = visual.baseFaceToTriangleRange.get(face.id);
         if (!range) continue;
 
         let triIntersects = false;
@@ -1331,11 +1365,16 @@ export class ViewportEngine {
         scale: [g.scale.x, g.scale.y, g.scale.z],
       };
     } else {
-      this.editDragStartMesh = visual.editableMesh.clone();
-      this.editDragStartVertexIds = visual.editableMesh.getVertexIdsFromSelection(
+      this.editDragStartMesh = visual.baseEditableMesh.clone();
+      this.editDragStartVertexIds = visual.baseEditableMesh.getVertexIdsFromSelection(
         this.editSelectionMode,
         this.selectedComponentIds,
       );
+      this.editDragStartVertexPositions.clear();
+      for (const vid of this.editDragStartVertexIds) {
+        const v = this.editDragStartMesh.getVertex(vid);
+        if (v) this.editDragStartVertexPositions.set(vid, [...v.position]);
+      }
       this.editGizmoAnchor.updateMatrixWorld(true);
       this.editDragStartAnchorInv.copy(this.editGizmoAnchor.matrixWorld).invert();
     }
@@ -1348,13 +1387,63 @@ export class ViewportEngine {
 
     if (this.workMode === 'object') {
       const g = visual.group;
-      this.callbacks.onLiveObjectTransform(this.selectedObjectId, {
+      const liveTransform: ObjectTransform = {
         position: [g.position.x, g.position.y, g.position.z],
         rotation: [g.rotation.x, g.rotation.y, g.rotation.z],
         scale: [g.scale.x, g.scale.y, g.scale.z],
-      });
+      };
+      this.callbacks.onLiveObjectTransform(this.selectedObjectId, liveTransform);
+
+      // Update any scene objects referencing this object as a Mirror Object live
+      this.sceneTransformRefs = this.sceneTransformRefs.map((ref) =>
+        ref.id === this.selectedObjectId
+          ? {
+              id: ref.id,
+              position: liveTransform.position,
+              rotation: liveTransform.rotation,
+              scale: liveTransform.scale,
+            }
+          : ref,
+      );
+      for (const other of this.visuals.values()) {
+        if (!other.modifiers || other.modifiers.length === 0) continue;
+        const refsDragged = other.modifiers.some(
+          (m) =>
+            m.enabled &&
+            m.type === 'mirror' &&
+            normalizeMirrorParams(m.params).mirrorObjectId ===
+              this.selectedObjectId,
+        );
+        if (!refsDragged) continue;
+        const ownerObj = this.currentObjectsData.get(other.id);
+        if (!ownerObj) continue;
+        const ownerRef: ModifierTransformRef = {
+          id: ownerObj.id,
+          position:
+            ownerObj.id === this.selectedObjectId
+              ? liveTransform.position
+              : ownerObj.transform.position,
+          rotation:
+            ownerObj.id === this.selectedObjectId
+              ? liveTransform.rotation
+              : ownerObj.transform.rotation,
+          scale:
+            ownerObj.id === this.selectedObjectId
+              ? liveTransform.scale
+              : ownerObj.transform.scale,
+        };
+        const evalRes = evaluateObjectModifiers(ownerObj.mesh, other.modifiers, {
+          ownerTransform: ownerRef,
+          sceneTransformRefs: this.sceneTransformRefs,
+        });
+        other.hasActiveModifiers = evalRes.hasActiveModifiers;
+        other.editableMesh = evalRes.hasActiveModifiers
+          ? EditableMesh.fromJSON(evalRes.mesh)
+          : other.baseEditableMesh;
+        this.rebuildObjectGeometry(other);
+      }
     } else if (this.editDragStartMesh) {
-      // Recompute editableMesh from dragStartMesh using delta matrix
+      // Recompute baseEditableMesh from dragStartMesh using delta matrix
       const nextMesh = this.editDragStartMesh.clone();
       this.editGizmoAnchor.updateMatrixWorld(true);
       visual.group.updateMatrixWorld(true);
@@ -1370,7 +1459,42 @@ export class ViewportEngine {
       _mat4C.multiply(visual.group.matrixWorld);
 
       applyTransformToVertices(nextMesh, this.editDragStartVertexIds, _mat4C, [0, 0, 0]);
-      visual.editableMesh = nextMesh;
+
+      const ownerObj = this.currentObjectsData.get(visual.id);
+      const ownerRef: ModifierTransformRef | undefined = ownerObj
+        ? {
+            id: ownerObj.id,
+            position: ownerObj.transform.position,
+            rotation: ownerObj.transform.rotation,
+            scale: ownerObj.transform.scale,
+          }
+        : undefined;
+
+      if (visual.modifiers.length > 0) {
+        clampVerticesForMirrorClipping(
+          nextMesh,
+          this.editDragStartVertexIds,
+          this.editDragStartVertexPositions,
+          visual.modifiers,
+          ownerRef,
+          this.sceneTransformRefs,
+        );
+      }
+
+      visual.baseEditableMesh = nextMesh;
+      if (hasActiveViewportModifiers(visual.modifiers)) {
+        const evalRes = evaluateObjectModifiers(nextMesh.toJSON(), visual.modifiers, {
+          ownerTransform: ownerRef,
+          sceneTransformRefs: this.sceneTransformRefs,
+        });
+        visual.hasActiveModifiers = evalRes.hasActiveModifiers;
+        visual.editableMesh = evalRes.hasActiveModifiers
+          ? EditableMesh.fromJSON(evalRes.mesh)
+          : nextMesh;
+      } else {
+        visual.hasActiveModifiers = false;
+        visual.editableMesh = nextMesh;
+      }
       visual.lastMeshData = null;
       this.rebuildObjectGeometry(visual);
       this.syncEditModeOverlays();
@@ -1397,11 +1521,39 @@ export class ViewportEngine {
       this.objectDragStartTransform = null;
     } else if (this.workMode === 'edit' && this.editDragStartMesh) {
       const before = this.editDragStartMesh;
-      const after = visual.editableMesh.clone();
+      const after = visual.baseEditableMesh.clone();
       this.editDragStartMesh = null;
+      this.editDragStartVertexPositions.clear();
       this.callbacks.onCommitMeshEdit(this.selectedObjectId, before, after);
       this.syncGizmoAttachment();
     }
+  }
+
+  private buildModifiersSignature(
+    objData: SceneObjectData,
+    transformRefs: ModifierTransformRef[],
+  ): string {
+    const mods = objData.modifiers ?? [];
+    if (mods.length === 0) return '';
+    const refMap = new Map(transformRefs.map((r) => [r.id, r]));
+    const refTransforms: ModifierTransformRef[] = [];
+    let needsOwner = false;
+    for (const m of mods) {
+      if (!m.enabled || m.showInViewport === false) continue;
+      if (m.type === 'mirror') {
+        const p = normalizeMirrorParams(m.params);
+        if (p.mirrorObjectId) {
+          needsOwner = true;
+          const targetRef = refMap.get(p.mirrorObjectId);
+          if (targetRef) refTransforms.push(targetRef);
+        }
+      }
+    }
+    return JSON.stringify({
+      mods,
+      owner: needsOwner ? objData.transform : null,
+      refs: refTransforms,
+    });
   }
 
   public syncScene(params: {
@@ -1427,6 +1579,7 @@ export class ViewportEngine {
     if (params.selectedObjectId) nextSelObjs.add(params.selectedObjectId);
     this.selectedObjectIds = nextSelObjs;
     this.currentObjectsData = new Map(params.objects.map((o) => [o.id, o]));
+    this.sceneTransformRefs = buildTransformRefsFromObjects(params.objects);
 
     this.workMode = params.workMode;
     this.editSelectionMode = params.editSelectionMode;
@@ -1487,12 +1640,37 @@ export class ViewportEngine {
         this.syncReferenceVisual(visual, objData, isSelected);
       } else {
         if (!(this.isGizmoDragging && this.workMode === 'edit' && this.selectedObjectId === objData.id)) {
+          const modSig = this.buildModifiersSignature(objData, this.sceneTransformRefs);
           if (
             visual.lastMeshData !== objData.mesh ||
-            visual.group.userData.meshRevision !== params.meshRevision
+            visual.group.userData.meshRevision !== params.meshRevision ||
+            visual.modifiersSignature !== modSig
           ) {
-            visual.editableMesh = EditableMesh.fromJSON(objData.mesh);
+            visual.modifiers = objData.modifiers ?? [];
+            visual.modifiersSignature = modSig;
+            visual.baseEditableMesh = EditableMesh.fromJSON(objData.mesh);
             visual.lastMeshData = objData.mesh;
+
+            if (hasActiveViewportModifiers(visual.modifiers)) {
+              const ownerRef: ModifierTransformRef = {
+                id: objData.id,
+                position: objData.transform.position,
+                rotation: objData.transform.rotation,
+                scale: objData.transform.scale,
+              };
+              const evalRes = evaluateObjectModifiers(objData.mesh, visual.modifiers, {
+                ownerTransform: ownerRef,
+                sceneTransformRefs: this.sceneTransformRefs,
+              });
+              visual.hasActiveModifiers = evalRes.hasActiveModifiers;
+              visual.editableMesh = evalRes.hasActiveModifiers
+                ? EditableMesh.fromJSON(evalRes.mesh)
+                : visual.baseEditableMesh;
+            } else {
+              visual.hasActiveModifiers = false;
+              visual.editableMesh = visual.baseEditableMesh;
+            }
+
             this.rebuildObjectGeometry(visual);
             visual.group.userData.meshRevision = params.meshRevision;
           }
@@ -1527,6 +1705,8 @@ export class ViewportEngine {
     visual.solidMesh.material.dispose();
     visual.wireEdges.geometry.dispose();
     visual.wireEdges.material.dispose();
+    visual.baseSolidCollider.geometry.dispose();
+    visual.baseSolidCollider.material.dispose();
     if (visual.refPlaneMesh) {
       visual.refPlaneMesh.geometry.dispose();
       visual.refPlaneMesh.material.dispose();
@@ -1640,6 +1820,11 @@ export class ViewportEngine {
       );
       dummySolid.visible = false;
 
+      const dummyCollider = new THREE.Mesh(
+        new THREE.BufferGeometry(),
+        new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }),
+      );
+
       group.add(refPlaneMesh, wireEdges);
 
       const visual: ObjectVisual = {
@@ -1648,13 +1833,20 @@ export class ViewportEngine {
         group,
         solidMesh: dummySolid,
         wireEdges,
+        baseSolidCollider: dummyCollider,
         refPlaneMesh,
         refTexture: null,
         refImageSrc: null,
         triangleToFaceId: [],
         faceToTriangleRange: new Map(),
+        baseTriangleToFaceId: [],
+        baseFaceToTriangleRange: new Map(),
+        baseEditableMesh: new EditableMesh(),
         editableMesh: new EditableMesh(),
         lastMeshData: null,
+        modifiers: [],
+        modifiersSignature: '',
+        hasActiveModifiers: false,
         hasFaces: false,
         locked: objData.locked,
       };
@@ -1686,7 +1878,33 @@ export class ViewportEngine {
     const wireEdges = new THREE.LineSegments(new THREE.BufferGeometry(), wireMat);
     wireEdges.userData.objectId = objData.id;
 
+    const baseSolidCollider = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }),
+    );
+
     group.add(solidMesh, wireEdges);
+
+    const baseMesh = EditableMesh.fromJSON(objData.mesh);
+    const modifiers = objData.modifiers ?? [];
+    let evalMesh = baseMesh;
+    let hasActiveModifiers = false;
+    if (hasActiveViewportModifiers(modifiers)) {
+      const ownerRef: ModifierTransformRef = {
+        id: objData.id,
+        position: objData.transform.position,
+        rotation: objData.transform.rotation,
+        scale: objData.transform.scale,
+      };
+      const evalRes = evaluateObjectModifiers(objData.mesh, modifiers, {
+        ownerTransform: ownerRef,
+        sceneTransformRefs: this.sceneTransformRefs,
+      });
+      hasActiveModifiers = evalRes.hasActiveModifiers;
+      if (hasActiveModifiers) {
+        evalMesh = EditableMesh.fromJSON(evalRes.mesh);
+      }
+    }
 
     const visual: ObjectVisual = {
       id: objData.id,
@@ -1694,14 +1912,24 @@ export class ViewportEngine {
       group,
       solidMesh,
       wireEdges,
+      baseSolidCollider,
       refPlaneMesh: null,
       refTexture: null,
       refImageSrc: null,
       triangleToFaceId: [],
       faceToTriangleRange: new Map(),
-      editableMesh: EditableMesh.fromJSON(objData.mesh),
+      baseTriangleToFaceId: [],
+      baseFaceToTriangleRange: new Map(),
+      baseEditableMesh: baseMesh,
+      editableMesh: evalMesh,
       lastMeshData: objData.mesh,
-      hasFaces: objData.mesh.faces.length > 0,
+      modifiers,
+      modifiersSignature: this.buildModifiersSignature(
+        objData,
+        this.sceneTransformRefs,
+      ),
+      hasActiveModifiers,
+      hasFaces: evalMesh.faces.length > 0,
       locked: objData.locked,
     };
 
@@ -1757,7 +1985,21 @@ export class ViewportEngine {
 
     const wireMat = visual.wireEdges.material;
     if (inEditOnThis) {
-      visual.wireEdges.visible = false; // Handled cleanly by editOverlayGroup
+      if (visual.hasActiveModifiers && (isWireframe || isXray)) {
+        // Show evaluated modifier wireframe subtly while Edit Mode overlay draws the base control cage
+        visual.wireEdges.visible = true;
+        wireMat.color.setHex(0x8a95a8);
+        if (!wireMat.transparent) {
+          wireMat.transparent = true;
+          wireMat.needsUpdate = true;
+        }
+        wireMat.opacity = isWireframe ? 0.48 : 0.34;
+        wireMat.depthTest = !isXray;
+        wireMat.depthWrite = false;
+        visual.wireEdges.renderOrder = 2;
+      } else {
+        visual.wireEdges.visible = false; // Handled cleanly by editOverlayGroup
+      }
       return;
     }
 
@@ -1850,7 +2092,25 @@ export class ViewportEngine {
     visual.wireEdges.geometry.dispose();
     visual.wireEdges.geometry = wireGeo;
 
-    if (this.editOverlaySourceMesh === visual.editableMesh) {
+    if (visual.hasActiveModifiers) {
+      const baseTriData = visual.baseEditableMesh.buildTriangulatedData();
+      visual.baseTriangleToFaceId = baseTriData.triangleToFaceId;
+      visual.baseFaceToTriangleRange = baseTriData.faceToTriangleRange;
+      const baseGeo = new THREE.BufferGeometry();
+      baseGeo.setAttribute(
+        'position',
+        new THREE.BufferAttribute(baseTriData.positions, 3),
+      );
+      baseGeo.computeBoundingBox();
+      baseGeo.computeBoundingSphere();
+      visual.baseSolidCollider.geometry.dispose();
+      visual.baseSolidCollider.geometry = baseGeo;
+    } else {
+      visual.baseTriangleToFaceId = triData.triangleToFaceId;
+      visual.baseFaceToTriangleRange = triData.faceToTriangleRange;
+    }
+
+    if (this.editOverlaySourceMesh === visual.baseEditableMesh) {
       this.editOverlaySourceMesh = null;
     }
   }
@@ -1875,21 +2135,53 @@ export class ViewportEngine {
     this.editOverlayGroup.matrix.copy(visual.group.matrixWorld);
     this.editOverlayGroup.matrixWorld.copy(visual.group.matrixWorld);
 
-    const mesh = visual.editableMesh;
+    // Edit Mode always renders interactive vertices/edges/faces from BASE topology only
+    const mesh = visual.baseEditableMesh;
     const xray = this.isXraySelectionActive();
     const isWireframe = this.displayMode === 'wireframe';
     const isXrayMode = this.displayMode === 'xray';
     const highContrastLight =
       isWireframe || (isXrayMode && this.xrayTransparency > 35);
 
-    // 1. All Edges
+    // 1. All Base Cage Edges
     const allEdgesMat = this.editAllEdgesLine.material as THREE.LineBasicMaterial;
     allEdgesMat.depthTest = !xray;
-    allEdgesMat.color.setHex(highContrastLight ? 0xc8d0dc : 0x111317);
+    allEdgesMat.color.setHex(
+      visual.hasActiveModifiers
+        ? highContrastLight
+          ? 0xf59e0b
+          : 0x1e2430
+        : highContrastLight
+          ? 0xc8d0dc
+          : 0x111317,
+    );
     allEdgesMat.opacity = isWireframe ? 0.88 : isXrayMode ? 0.76 : 0.85;
     if (this.editOverlaySourceMesh !== mesh) {
       this.editAllEdgesLine.geometry.dispose();
-      this.editAllEdgesLine.geometry = visual.wireEdges.geometry.clone();
+      if (!visual.hasActiveModifiers) {
+        this.editAllEdgesLine.geometry = visual.wireEdges.geometry.clone();
+      } else {
+        const baseEdgePositions = new Float32Array(mesh.edges.length * 6);
+        let bPtr = 0;
+        for (const edge of mesh.edges) {
+          const v0 = mesh.getVertex(edge.v0);
+          const v1 = mesh.getVertex(edge.v1);
+          if (!v0 || !v1) continue;
+          baseEdgePositions[bPtr++] = v0.position[0];
+          baseEdgePositions[bPtr++] = v0.position[1];
+          baseEdgePositions[bPtr++] = v0.position[2];
+          baseEdgePositions[bPtr++] = v1.position[0];
+          baseEdgePositions[bPtr++] = v1.position[1];
+          baseEdgePositions[bPtr++] = v1.position[2];
+        }
+        const cageGeo = new THREE.BufferGeometry();
+        cageGeo.setAttribute(
+          'position',
+          new THREE.BufferAttribute(baseEdgePositions.subarray(0, bPtr), 3),
+        );
+        cageGeo.computeBoundingSphere();
+        this.editAllEdgesLine.geometry = cageGeo;
+      }
       this.editOverlaySourceMesh = mesh;
     }
 
@@ -1969,13 +2261,15 @@ export class ViewportEngine {
       this.editSelectedEdgeBars.visible = false;
     }
 
-    // 3. Selected + Derived Faces Overlay
+    // 3. Selected + Derived Faces Overlay (base topology faces only)
     const selFacePositions: number[] = [];
     if (derived.faceIds.size > 0) {
-      const solidPos = visual.solidMesh.geometry.getAttribute('position');
+      const solidPos = (
+        visual.hasActiveModifiers ? visual.baseSolidCollider : visual.solidMesh
+      ).geometry.getAttribute('position');
       if (solidPos) {
         for (const fid of derived.faceIds) {
-          const range = visual.faceToTriangleRange.get(fid);
+          const range = visual.baseFaceToTriangleRange.get(fid);
           if (!range) continue;
           const startVert = range.start * 3;
           const endVert = (range.start + range.count) * 3;
@@ -2130,8 +2424,8 @@ export class ViewportEngine {
       return;
     }
 
-    // Edit Mode: attach to centroid of selected vertices
-    const vertIds = visual.editableMesh.getVertexIdsFromSelection(
+    // Edit Mode: attach to centroid of selected base vertices
+    const vertIds = visual.baseEditableMesh.getVertexIdsFromSelection(
       this.editSelectionMode,
       this.selectedComponentIds,
     );
@@ -2140,7 +2434,7 @@ export class ViewportEngine {
       return;
     }
 
-    const centroidLocal = visual.editableMesh.computeCentroid(vertIds);
+    const centroidLocal = visual.baseEditableMesh.computeCentroid(vertIds);
     if (!centroidLocal) {
       this.transformControls.detach();
       return;

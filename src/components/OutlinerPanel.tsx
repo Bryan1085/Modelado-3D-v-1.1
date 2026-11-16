@@ -48,6 +48,12 @@ import {
   SceneObjectData,
   WorkMode,
 } from '../core/project/types';
+import {
+  ModifierDiagnostic,
+  ModifierSlot,
+  ModifierType,
+} from '../core/modifiers/types';
+import { ModifierStackPanel } from './ModifierStackPanel';
 
 interface OutlinerPanelProps {
   scenes: SceneData[];
@@ -106,6 +112,24 @@ interface OutlinerPanelProps {
     >,
     recordHistory?: boolean,
   ) => void;
+  modifierDiagnostics: Record<string, ModifierDiagnostic>;
+  evaluatedVertexCount: number;
+  evaluatedFaceCount: number;
+  hasActiveModifiers: boolean;
+  onAddModifier: (objectId: string, type: ModifierType) => void;
+  onUpdateModifier: (
+    objectId: string,
+    modifierId: string,
+    patch: Partial<ModifierSlot>,
+    recordHistory?: boolean,
+  ) => void;
+  onReorderModifier: (
+    objectId: string,
+    modifierId: string,
+    direction: 'up' | 'down',
+  ) => void;
+  onRemoveModifier: (objectId: string, modifierId: string) => void;
+  onApplyModifier: (objectId: string, modifierId: string) => void;
   onClose?: () => void;
 }
 
@@ -203,6 +227,15 @@ export const OutlinerPanel: React.FC<OutlinerPanelProps> = ({
   onDeleteCollection,
   onMoveObjectToCollection,
   onUpdateReferenceImageProps,
+  modifierDiagnostics,
+  evaluatedVertexCount,
+  evaluatedFaceCount,
+  hasActiveModifiers,
+  onAddModifier,
+  onUpdateModifier,
+  onReorderModifier,
+  onRemoveModifier,
+  onApplyModifier,
   onClose,
 }) => {
   const [activeTab, setActiveTab] = useState<'hierarchy' | 'modifiers'>(
@@ -823,30 +856,26 @@ export const OutlinerPanel: React.FC<OutlinerPanelProps> = ({
       </div>
 
       {activeTab === 'modifiers' ? (
-        /* PESTAÑA MODIFICADORES (Preparada para futuras actualizaciones, sin botones ficticios) */
+        /* PESTAÑA MODIFICADORES */
         <div
           id="outliner-tabpanel-modifiers"
           role="tabpanel"
           aria-labelledby="outliner-tab-modifiers"
-          className="flex-1 flex flex-col overflow-y-auto cad-scroll p-3 space-y-3"
+          className="flex-1 min-h-0 flex flex-col"
         >
-          <div className="pb-2 border-b border-[#262931] flex items-center justify-between gap-2">
-            <span className="text-xs font-semibold text-[#e4e6eb]">
-              Pila de Modificadores
-            </span>
-            {selectedObj && (
-              <span className="text-[11px] text-[#8e95a2] truncate max-w-[120px]">
-                {selectedObj.name}
-              </span>
-            )}
-          </div>
-
-          <div className="flex-1 min-h-[180px] rounded-lg border border-dashed border-[#2f3440] bg-[#14161b] p-4 flex flex-col items-center justify-center text-center gap-2">
-            <SlidersHorizontal className="w-5 h-5 text-[#6b7280]" />
-            <p className="text-xs text-[#9ca3af] leading-relaxed max-w-[210px]">
-              Los modificadores estarán disponibles en futuras actualizaciones
-            </p>
-          </div>
+          <ModifierStackPanel
+            selectedObject={selectedObj}
+            sceneObjects={objects}
+            diagnostics={modifierDiagnostics}
+            evaluatedVertexCount={evaluatedVertexCount}
+            evaluatedFaceCount={evaluatedFaceCount}
+            hasActiveModifiers={hasActiveModifiers}
+            onAddModifier={onAddModifier}
+            onUpdateModifier={onUpdateModifier}
+            onReorderModifier={onReorderModifier}
+            onRemoveModifier={onRemoveModifier}
+            onApplyModifier={onApplyModifier}
+          />
         </div>
       ) : (
         /* PESTAÑA JERARQUÍA */

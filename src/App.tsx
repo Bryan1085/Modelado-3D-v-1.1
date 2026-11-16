@@ -28,6 +28,7 @@ import { exportObjectsToObj } from './core/io/objExport';
 import { parseObjContent } from './core/io/objImport';
 import { exportObjectsToStl } from './core/io/stlExport';
 import { inspectStlBuffer, parseStlBuffer } from './core/io/stlImport';
+import { evaluateObjectsForExport } from './core/modifiers/evaluateModifiers';
 import {
   ObjectTransform,
   ReferenceImageOrientation,
@@ -308,6 +309,7 @@ export default function App() {
         targets = sceneObjects;
       }
 
+      const evaluatedTargets = evaluateObjectsForExport(targets, sceneObjects);
       const baseFilename =
         config.scope === 'selected' && targets.length === 1
           ? stripFileExtension(targets[0].name)
@@ -322,7 +324,7 @@ export default function App() {
             label: 'Preparando geometría...',
             progress: 0.1,
           });
-          const result = await exportObjectsToObj(targets, {
+          const result = await exportObjectsToObj(evaluatedTargets, {
             applyTransform: config.applyTransform,
             exportScale: config.exportScale,
             onProgress: (progress, label) => {
@@ -352,7 +354,7 @@ export default function App() {
             label: 'Verificando y triangulando mallas...',
             progress: 0.1,
           });
-          const result = await exportObjectsToStl(targets, {
+          const result = await exportObjectsToStl(evaluatedTargets, {
             binary: config.stlBinary,
             applyTransform: config.applyTransform,
             exportScale: config.exportScale,
@@ -742,6 +744,21 @@ export default function App() {
             onDeleteCollection={store.deleteCollection}
             onMoveObjectToCollection={store.moveObjectToCollection}
             onUpdateReferenceImageProps={store.updateReferenceImageProps}
+            modifierDiagnostics={store.selectedModifierDiagnostics.diagnostics}
+            evaluatedVertexCount={
+              store.selectedModifierDiagnostics.evaluatedVertexCount
+            }
+            evaluatedFaceCount={
+              store.selectedModifierDiagnostics.evaluatedFaceCount
+            }
+            hasActiveModifiers={
+              store.selectedModifierDiagnostics.hasActiveModifiers
+            }
+            onAddModifier={store.addModifier}
+            onUpdateModifier={store.updateModifier}
+            onReorderModifier={store.reorderModifier}
+            onRemoveModifier={store.removeModifier}
+            onApplyModifier={store.applyModifier}
             onClose={() => setShowOutliner(false)}
           />
         )}
@@ -800,7 +817,10 @@ export default function App() {
         <ExportModelModal
           initialFormat={exportModalConfig.format}
           initialScope={exportModalConfig.scope}
-          sceneObjects={store.activeScene.objects}
+          sceneObjects={evaluateObjectsForExport(
+            store.activeScene.objects,
+            store.activeScene.objects,
+          )}
           selectedObjectId={store.selectedObjectId}
           onCancel={() => setExportModalConfig(null)}
           onExport={(cfg) => {

@@ -96,6 +96,22 @@ import {
   WorkMode,
 } from '../core/project/types';
 import { SerializedEditableMesh } from '../core/mesh/EditableMesh';
+import {
+  applySingleModifierToMesh,
+  buildTransformRefsFromObjects,
+  evaluateObjectModifiers,
+} from '../core/modifiers/evaluateModifiers';
+import { clampVerticesForMirrorClipping } from '../core/modifiers/mirrorModifier';
+import {
+  ModifierDiagnostic,
+  ModifierSlot,
+  ModifierTransformRef,
+  ModifierType,
+  createDefaultMirrorParams,
+  createDefaultSubdivisionParams,
+  normalizeMirrorParams,
+  normalizeSubdivisionParams,
+} from '../core/modifiers/types';
 
 export function applyComponentSelection(
   prev: ReadonlySet<string>,
@@ -282,6 +298,11 @@ export function useModelerStore() {
   const selectedObject = useMemo(
     () => activeObjects.find((o) => o.id === selectedObjectId) ?? null,
     [activeObjects, selectedObjectId],
+  );
+
+  const sceneTransformRefs = useMemo(
+    () => buildTransformRefsFromObjects(activeObjects),
+    [activeObjects],
   );
 
   const canUndo = undoStackRef.current.length > 0 && historyVersion >= 0;
@@ -733,6 +754,37 @@ export function useModelerStore() {
       pushHistory(snapshot);
 
       const cleanAfterMesh = afterMesh.clone();
+      const targetObj = activeObjects.find((o) => o.id === objectId);
+      if (targetObj?.modifiers && targetObj.modifiers.length > 0) {
+        const startPositions = new Map<string, Vec3>();
+        const movedIds: string[] = [];
+        for (const bv of beforeMesh.vertices) {
+          startPositions.set(bv.id, [...bv.position]);
+          const av = cleanAfterMesh.getVertex(bv.id);
+          if (
+            av &&
+            (Math.abs(av.position[0] - bv.position[0]) > 1e-8 ||
+              Math.abs(av.position[1] - bv.position[1]) > 1e-8 ||
+              Math.abs(av.position[2] - bv.position[2]) > 1e-8)
+          ) {
+            movedIds.push(bv.id);
+          }
+        }
+        const ownerRef: ModifierTransformRef = {
+          id: targetObj.id,
+          position: targetObj.transform.position,
+          rotation: targetObj.transform.rotation,
+          scale: targetObj.transform.scale,
+        };
+        clampVerticesForMirrorClipping(
+          cleanAfterMesh,
+          movedIds,
+          startPositions,
+          targetObj.modifiers,
+          ownerRef,
+          sceneTransformRefs,
+        );
+      }
       cleanAfterMesh.clearCustomNormals();
 
       setProject((p) =>
@@ -746,7 +798,7 @@ export function useModelerStore() {
       setHasUnsavedChanges(true);
       setMeshRevision((r) => r + 1);
     },
-    [makeSnapshot, pushHistory],
+    [activeObjects, makeSnapshot, pushHistory, sceneTransformRefs],
   );
 
   const renameObject = useCallback(
@@ -1660,9 +1712,29 @@ export function useModelerStore() {
       if (Math.abs(delta) < 1e-6) return;
 
       pushHistory(makeSnapshot());
+      const startPositions = new Map<string, Vec3>();
       for (const vid of vertIds) {
         const v = mesh.getVertex(vid);
-        if (v) v.position[axis] += delta;
+        if (v) {
+          startPositions.set(vid, [...v.position]);
+          v.position[axis] += delta;
+        }
+      }
+      if (selectedObject.modifiers && selectedObject.modifiers.length > 0) {
+        const ownerRef: ModifierTransformRef = {
+          id: selectedObject.id,
+          position: selectedObject.transform.position,
+          rotation: selectedObject.transform.rotation,
+          scale: selectedObject.transform.scale,
+        };
+        clampVerticesForMirrorClipping(
+          mesh,
+          vertIds,
+          startPositions,
+          selectedObject.modifiers,
+          ownerRef,
+          sceneTransformRefs,
+        );
       }
       mesh.clearCustomNormals();
       const updated = mesh.toJSON();
@@ -1682,8 +1754,225 @@ export function useModelerStore() {
       makeSnapshot,
       operatorSession,
       pushHistory,
+      sceneTransformRefs,
       selectedComponentIds,
       selectedObject,
+      workMode,
+    ],
+  );
+
+  /* ==========================================================================
+   * Non-Destructive Modifiers (Mirror & Subdivision Surface)
+   * ======================================================================== */
+  const addModifier = useCallback(
+    (objectId: string, type: ModifierType) => {
+      const target = activeObjects.find((o) => o.id === objectId);
+      if (!target) return;
+      if (!isEditableMeshObject(target)) {
+        showToast('Solo los objetos de malla admiten modificadores');
+        return;
+      }
+      if (target.locked) {
+        showToast('Desbloquea el objeto antes de añadir modificadores');
+        return;
+      }
+
+      pushHistory(makeSnapshot());
+      const newSlot: ModifierSlot = {
+        id: generateId('mod'),
+        type,
+        enabled: true,
+        showInViewport: true,
+        expanded: true,
+        params:
+          type === 'mirror'
+            ? createDefaultMirrorParams()
+            : createDefaultSubdivisionParams(),
+      };
+
+      setProject((p) =>
+        updateActiveScene(p, (scene) => ({
+          ...scene,
+          objects: scene.objects.map((o) =>
+            o.id === objectId
+              ? { ...o, modifiers: [...(o.modifiers ?? []), newSlot] }
+              : o,
+          ),
+        })),
+      );
+      setHasUnsavedChanges(true);
+      showToast(
+        type === 'mirror'
+          ? 'Modificador Mirror añadido'
+          : 'Modificador Subdivision Surface añadido',
+      );
+    },
+    [activeObjects, makeSnapshot, pushHistory, showToast],
+  );
+
+  const updateModifier = useCallback(
+    (
+      objectId: string,
+      modifierId: string,
+      patch: Partial<ModifierSlot>,
+      recordHistory = true,
+    ) => {
+      const target = activeObjects.find((o) => o.id === objectId);
+      if (!target) return;
+      if (target.locked) {
+        showToast('El objeto está bloqueado');
+        return;
+      }
+      if (recordHistory) {
+        pushHistory(makeSnapshot());
+      }
+      setProject((p) =>
+        updateActiveScene(p, (scene) => ({
+          ...scene,
+          objects: scene.objects.map((o) => {
+            if (o.id !== objectId) return o;
+            const nextMods = (o.modifiers ?? []).map((m) => {
+              if (m.id !== modifierId) return m;
+              const nextParams = patch.params
+                ? m.type === 'mirror'
+                  ? normalizeMirrorParams({
+                      ...(m.params as Record<string, unknown>),
+                      ...(patch.params as Record<string, unknown>),
+                    })
+                  : m.type === 'subdivision'
+                    ? normalizeSubdivisionParams({
+                        ...(m.params as Record<string, unknown>),
+                        ...(patch.params as Record<string, unknown>),
+                      })
+                    : { ...(m.params as Record<string, unknown>), ...(patch.params as Record<string, unknown>) }
+                : m.params;
+              return {
+                ...m,
+                ...patch,
+                params: nextParams,
+              };
+            });
+            return { ...o, modifiers: nextMods };
+          }),
+        })),
+      );
+      setHasUnsavedChanges(true);
+    },
+    [activeObjects, makeSnapshot, pushHistory, showToast],
+  );
+
+  const reorderModifier = useCallback(
+    (objectId: string, modifierId: string, direction: 'up' | 'down') => {
+      const target = activeObjects.find((o) => o.id === objectId);
+      if (!target || target.locked) return;
+      const list = [...(target.modifiers ?? [])];
+      const idx = list.findIndex((m) => m.id === modifierId);
+      if (idx < 0) return;
+      const nextIdx = direction === 'up' ? idx - 1 : idx + 1;
+      if (nextIdx < 0 || nextIdx >= list.length) return;
+
+      pushHistory(makeSnapshot());
+      const [item] = list.splice(idx, 1);
+      list.splice(nextIdx, 0, item);
+
+      setProject((p) =>
+        updateActiveScene(p, (scene) => ({
+          ...scene,
+          objects: scene.objects.map((o) =>
+            o.id === objectId ? { ...o, modifiers: list } : o,
+          ),
+        })),
+      );
+      setHasUnsavedChanges(true);
+    },
+    [activeObjects, makeSnapshot, pushHistory],
+  );
+
+  const removeModifier = useCallback(
+    (objectId: string, modifierId: string) => {
+      const target = activeObjects.find((o) => o.id === objectId);
+      if (!target) return;
+      if (target.locked) {
+        showToast('El objeto está bloqueado');
+        return;
+      }
+      pushHistory(makeSnapshot());
+      setProject((p) =>
+        updateActiveScene(p, (scene) => ({
+          ...scene,
+          objects: scene.objects.map((o) =>
+            o.id === objectId
+              ? {
+                  ...o,
+                  modifiers: (o.modifiers ?? []).filter((m) => m.id !== modifierId),
+                }
+              : o,
+          ),
+        })),
+      );
+      setHasUnsavedChanges(true);
+      showToast('Modificador eliminado sin alterar la malla base');
+    },
+    [activeObjects, makeSnapshot, pushHistory, showToast],
+  );
+
+  const applyModifier = useCallback(
+    (objectId: string, modifierId: string) => {
+      const target = activeObjects.find((o) => o.id === objectId);
+      if (!target) return;
+      if (target.locked) {
+        showToast('Desbloquea el objeto antes de aplicar modificadores');
+        return;
+      }
+      setOperatorSession(null);
+
+      const ownerRef: ModifierTransformRef = {
+        id: target.id,
+        position: target.transform.position,
+        rotation: target.transform.rotation,
+        scale: target.transform.scale,
+      };
+      const res = applySingleModifierToMesh(
+        target.mesh,
+        target.modifiers ?? [],
+        modifierId,
+        ownerRef,
+        sceneTransformRefs,
+      );
+      if (!res.success || !res.mesh) {
+        showToast(res.error ?? 'No se pudo aplicar el modificador');
+        return;
+      }
+
+      pushHistory(makeSnapshot());
+      setProject((p) =>
+        updateActiveScene(p, (scene) => ({
+          ...scene,
+          objects: scene.objects.map((o) =>
+            o.id === objectId
+              ? {
+                  ...o,
+                  mesh: res.mesh!,
+                  modifiers: res.remainingModifiers ?? [],
+                }
+              : o,
+          ),
+        })),
+      );
+      if (workMode === 'edit' && selectedObjectId === objectId) {
+        setSelectedComponentIds(new Set());
+      }
+      setHasUnsavedChanges(true);
+      setMeshRevision((r) => r + 1);
+      showToast('Modificador aplicado a la geometría');
+    },
+    [
+      activeObjects,
+      makeSnapshot,
+      pushHistory,
+      sceneTransformRefs,
+      selectedObjectId,
+      showToast,
       workMode,
     ],
   );
@@ -2185,6 +2474,51 @@ export function useModelerStore() {
     [operatorPreview.previewSelectedIds, selectedComponentIds],
   );
 
+  const selectedModifierDiagnostics = useMemo(() => {
+    const empty: {
+      diagnostics: Record<string, ModifierDiagnostic>;
+      evaluatedVertexCount: number;
+      evaluatedEdgeCount: number;
+      evaluatedFaceCount: number;
+      hasActiveModifiers: boolean;
+    } = {
+      diagnostics: {},
+      evaluatedVertexCount: renderedSelectedObject?.mesh.vertices.length ?? 0,
+      evaluatedEdgeCount: renderedSelectedObject?.mesh.edges.length ?? 0,
+      evaluatedFaceCount: renderedSelectedObject?.mesh.faces.length ?? 0,
+      hasActiveModifiers: false,
+    };
+    if (
+      !renderedSelectedObject ||
+      !isEditableMeshObject(renderedSelectedObject) ||
+      !renderedSelectedObject.modifiers ||
+      renderedSelectedObject.modifiers.length === 0
+    ) {
+      return empty;
+    }
+    const ownerRef: ModifierTransformRef = {
+      id: renderedSelectedObject.id,
+      position: renderedSelectedObject.transform.position,
+      rotation: renderedSelectedObject.transform.rotation,
+      scale: renderedSelectedObject.transform.scale,
+    };
+    const evalRes = evaluateObjectModifiers(
+      renderedSelectedObject.mesh,
+      renderedSelectedObject.modifiers,
+      {
+        ownerTransform: ownerRef,
+        sceneTransformRefs,
+      },
+    );
+    return {
+      diagnostics: evalRes.diagnostics,
+      evaluatedVertexCount: evalRes.mesh.vertices.length,
+      evaluatedEdgeCount: evalRes.mesh.edges.length,
+      evaluatedFaceCount: evalRes.mesh.faces.length,
+      hasActiveModifiers: evalRes.hasActiveModifiers,
+    };
+  }, [renderedSelectedObject, sceneTransformRefs]);
+
   return {
     project,
     scenes: renderedScenes,
@@ -2200,6 +2534,7 @@ export function useModelerStore() {
     workMode,
     editSelectionMode,
     selectedComponentIds: renderedSelectedComponentIds,
+    selectedModifierDiagnostics,
     activeTool,
     axisConstraint,
     projection,
@@ -2273,6 +2608,11 @@ export function useModelerStore() {
     resetRadialLayout,
     resetTouchSettings,
     updateSelectedVerticesPosition,
+    addModifier,
+    updateModifier,
+    reorderModifier,
+    removeModifier,
+    applyModifier,
     startEditOperator,
     updateOperatorConfig,
     pickLoopCutEdge,
